@@ -1,42 +1,30 @@
-#NoEnv  ; Recommended for performance and compatibility with future AutoHotkey releases.
-; #Warn  ; Enable warnings to assist with detecting common errors.
-SendMode Input  ; Recommended for new scripts due to its superior speed and reliability.
-SetWorkingDir %A_ScriptDir%  ; Ensures a consistent starting directory.
+; Recommended for performance and compatibility with future AutoHotkey releases.
+#NoEnv  
+; Recommended for new scripts due to its superior speed and reliability.
+SendMode Input  
+; Ensures a consistent starting directory.
+SetWorkingDir %A_ScriptDir%  
+
+; Since I use caps as the modifier, this prevents me from killing myself
+SetCapsLockState, alwaysoff
 
 ; Main Navigation
-CAPSLOCK & j::MoveCursor("{LEFT}")
-CAPSLOCK & l::MoveCursor("{RIGHT}")
-CAPSLOCK & i::MoveCursor("{UP}")
-CAPSLOCK & k::MoveCursor("{DOWN}")
-CAPSLOCK & h::MoveCursor("{HOME}")
-CAPSLOCK & `;::MoveCursor("{END}")
-CAPSLOCK & BACKSPACE::Send {DELETE}
+CapsLock & i::send {Blind}{Up}
+CapsLock & k::send {Blind}{Down}
+CapsLock & j::send {Blind}{Left}
+CapsLock & l::send {Blind}{Right}
+CapsLock & h::send {Blind}{Home}
+CapsLock & `;::send {Blind}{End}
 
-; Navigation Combos
-MoveCursor(key) {
-    shift := GetKeyState("SHIFT","P")
-    control := GetKeyState("CONTROL","P")
-    controlShift := control && shift
+; Volume
+CapsLock & w::send {Volume_Up}
+CapsLock & q::send {Volume_Down}
+CapsLock & Tab::send {Volume_Mute}
 
-    if controlShift {
-        Send, ^+%key%
-    }
-    else if shift {
-        Send, +%key%
-    }
-    else if control {
-        Send, ^%key%
-    }
-    else {
-        Send, %key%
-    }
-}
+; media control
+CapsLock & e::send {Media_Prev}
+CapsLock & r::send {Media_Play_Pause}
+CapsLock & t::send {Media_Prev}
 
-; Alternatively, using Alt...
-ALT & j::MoveCursor("{LEFT}")
-ALT & l::MoveCursor("{RIGHT}")
-ALT & i::MoveCursor("{UP}")
-ALT & k::MoveCursor("{DOWN}")
-ALT & h::MoveCursor("{HOME}")
-ALT & `;::MoveCursor("{END}")
-ALT & BACKSPACE::Send {DELETE}
+; 'a' adds shift while caps is held to allow easier text nav
+Capslock & a::Ctrl
