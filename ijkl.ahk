@@ -28,3 +28,6 @@ CapsLock & t::send {Media_Prev}
 
 ; 'a' adds shift while caps is held to allow easier text nav
 Capslock & a::Ctrl
+
+Capslock & o::Del
+Capslock & u::BackSpace
