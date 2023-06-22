@@ -11,10 +11,7 @@ else
 	send a
 return
 
-a Up::
-if GetKeyState("CapsLock", "P")
-	send {Ctrl Up}
-return
+a Up::send {Ctrl Up}
 
 CapsLock & i::send {Blind}{Up}
 CapsLock & k::send {Blind}{Down}
