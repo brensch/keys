@@ -2,7 +2,7 @@
 SendMode Input  
 SetWorkingDir %A_ScriptDir%  
 
-SetCapsLockState, alwaysoff
+SetCapsLockState, off
 
 a::
 if GetKeyState("CapsLock", "P")
