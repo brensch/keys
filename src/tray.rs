@@ -3,14 +3,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct TrayManager {
     hwnd: HWND,
-    hicon: HICON,
 }
 
 impl TrayManager {
@@ -19,76 +17,8 @@ impl TrayManager {
             let class_name = wide_string("KeyboardRemapperClass");
             let hinstance = GetModuleHandleW(None)?;
 
-            // Create a simple 16x16 icon for the tray
-            let bitmap_info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: 16,
-                    biHeight: 16,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    biSizeImage: 0,
-                    biXPelsPerMeter: 0,
-                    biYPelsPerMeter: 0,
-                    biClrUsed: 0,
-                    biClrImportant: 0,
-                },
-                bmiColors: [RGBQUAD::default()],
-            };
-
-            let mut bits = vec![0u8; 16 * 16 * 4];
-            let dc = GetDC(HWND(0));
-            let color_dc = CreateCompatibleDC(dc);
-            let bitmap = CreateDIBSection(
-                color_dc,
-                &bitmap_info,
-                DIB_RGB_COLORS,
-                &mut bits.as_mut_ptr() as *mut _ as *mut *mut std::ffi::c_void,
-                None,
-                0,
-            )
-            .unwrap();
-
-            let mask_dc = CreateCompatibleDC(dc);
-            let mask = CreateBitmap(16, 16, 1, 1, None);
-
-            let old_color = SelectObject(color_dc, bitmap);
-            let old_mask = SelectObject(mask_dc, mask);
-
-            // Fill the entire icon with a solid color (black in this case)
-            let brush = CreateSolidBrush(COLORREF(0x00000000));
-            FillRect(
-                color_dc,
-                &RECT {
-                    left: 0,
-                    top: 0,
-                    right: 16,
-                    bottom: 16,
-                },
-                brush,
-            );
-            DeleteObject(brush);
-
-            // Create the icon
-            let icon_info = ICONINFO {
-                fIcon: BOOL::from(true),
-                xHotspot: 0,
-                yHotspot: 0,
-                hbmMask: HBITMAP(mask.0),
-                hbmColor: bitmap,
-            };
-
-            let hicon = CreateIconIndirect(&icon_info);
-
-            // Clean up
-            SelectObject(color_dc, old_color);
-            SelectObject(mask_dc, old_mask);
-            DeleteDC(color_dc);
-            DeleteDC(mask_dc);
-            DeleteObject(bitmap);
-            DeleteObject(mask);
-            ReleaseDC(HWND(0), dc);
+            // Load a standard Windows icon for now
+            let hicon = LoadIconW(None, IDI_QUESTION)?;
 
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -100,7 +30,6 @@ impl TrayManager {
 
             let atom = RegisterClassExW(&wc);
             if atom == 0 {
-                DestroyIcon(hicon);
                 return Err(anyhow!("Failed to register window class"));
             }
 
@@ -122,7 +51,6 @@ impl TrayManager {
             );
 
             if hwnd.0 == 0 {
-                DestroyIcon(hicon);
                 return Err(anyhow!("Failed to create window"));
             }
 
@@ -143,15 +71,13 @@ impl TrayManager {
 
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
                 DestroyWindow(hwnd);
-                DestroyIcon(hicon);
                 return Err(anyhow!("Failed to create tray icon"));
             }
 
-            Ok(Self { hwnd, hicon })
+            Ok(Self { hwnd })
         }
     }
 
-    // ... rest of the implementation remains the same
     extern "system" fn window_proc(
         hwnd: HWND,
         msg: u32,
@@ -233,7 +159,6 @@ impl Drop for TrayManager {
                 ..Default::default()
             };
             Shell_NotifyIconW(NIM_DELETE, &nid);
-            DestroyIcon(self.hicon);
             DestroyWindow(self.hwnd);
         }
     }
