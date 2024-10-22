@@ -1,32 +1,37 @@
-#NoEnv  
-SendMode Input  
-SetWorkingDir %A_ScriptDir%  
+#Requires AutoHotkey v2.0
 
-SetCapsLockState, off
+SetWorkingDir A_ScriptDir
+SetCapsLockState "AlwaysOff"
 
-a::
-if GetKeyState("CapsLock", "P")
-	send {Ctrl Down}
-else 
-	send a
-return
+a:: {
+    if GetKeyState("CapsLock", "P")
+        Send "{Ctrl Down}"
+    else 
+        Send "a"
+}
 
-a Up::send {Ctrl Up}
+a up:: Send "{Ctrl Up}"
 
-CapsLock & i::send {Blind}{Up}
-CapsLock & k::send {Blind}{Down}
-CapsLock & j::send {Blind}{Left}
-CapsLock & l::send {Blind}{Right}
-CapsLock & h::send {Blind}{Home}
-CapsLock & `;::send {Blind}{End}
+; Arrow key mappings
+CapsLock & i:: Send "{Blind}{Up}"
+CapsLock & k:: Send "{Blind}{Down}"
+CapsLock & j:: Send "{Blind}{Left}"
+CapsLock & l:: Send "{Blind}{Right}"
 
-CapsLock & w::send {Volume_Up}
-CapsLock & q::send {Volume_Down}
-CapsLock & Tab::send {Volume_Mute}
+; Home/End mappings
+CapsLock & h:: Send "{Blind}{Home}"
+CapsLock & `;:: Send "{Blind}{End}"
 
-CapsLock & e::send {Media_Prev}
-CapsLock & r::send {Media_Play_Pause}
-CapsLock & t::send {Media_Next}
+; Volume controls
+CapsLock & w:: Send "{Volume_Up}"
+CapsLock & q:: Send "{Volume_Down}"
+CapsLock & Tab:: Send "{Volume_Mute}"
 
-Capslock & o::send {Del}
-Capslock & u::send {BackSpace}
+; Media controls
+CapsLock & e:: Send "{Media_Prev}"
+CapsLock & r:: Send "{Media_Play_Pause}"
+CapsLock & t:: Send "{Media_Next}"
+
+; Delete/Backspace
+CapsLock & o:: Send "{Delete}"
+CapsLock & u:: Send "{Backspace}"
