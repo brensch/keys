@@ -9,6 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct TrayManager {
     hwnd: HWND,
+    hicon: HICON,
 }
 
 impl TrayManager {
@@ -17,26 +18,29 @@ impl TrayManager {
             let class_name = wide_string("KeyboardRemapperClass");
             let hinstance = GetModuleHandleW(None)?;
 
-            // Load a standard Windows icon for now
-            let hicon = LoadIconW(None, IDI_QUESTION)?;
+            // Load the icon from the embedded resources
+            let hicon = LoadIconW(hinstance, PCWSTR::from_raw(1 as *const u16))
+                .map_err(|_| anyhow!("Failed to load icon from resource"))?;
 
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 lpfnWndProc: Some(Self::window_proc),
                 hInstance: hinstance,
                 lpszClassName: PCWSTR(class_name.as_ptr()),
+                hIcon: hicon,
                 ..Default::default()
             };
 
             let atom = RegisterClassExW(&wc);
             if atom == 0 {
+                DestroyIcon(hicon);
                 return Err(anyhow!("Failed to register window class"));
             }
 
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 PCWSTR(class_name.as_ptr()),
-                PCWSTR(wide_string("Keyboard Remapper").as_ptr()),
+                PCWSTR(wide_string("keys").as_ptr()),
                 WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -51,6 +55,7 @@ impl TrayManager {
             );
 
             if hwnd.0 == 0 {
+                DestroyIcon(hicon);
                 return Err(anyhow!("Failed to create window"));
             }
 
@@ -66,15 +71,16 @@ impl TrayManager {
                 ..Default::default()
             };
 
-            let tooltip = wide_string("Keyboard Remapper");
+            let tooltip = wide_string("keys");
             nid.szTip[..tooltip.len()].copy_from_slice(&tooltip);
 
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
                 DestroyWindow(hwnd);
+                DestroyIcon(hicon);
                 return Err(anyhow!("Failed to create tray icon"));
             }
 
-            Ok(Self { hwnd })
+            Ok(Self { hwnd, hicon })
         }
     }
 
@@ -159,6 +165,7 @@ impl Drop for TrayManager {
                 ..Default::default()
             };
             Shell_NotifyIconW(NIM_DELETE, &nid);
+            DestroyIcon(self.hicon);
             DestroyWindow(self.hwnd);
         }
     }
