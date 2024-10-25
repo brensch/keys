@@ -83,6 +83,14 @@ impl KeyboardManager {
             return LRESULT(1);
         }
 
+        // Let Alt key events pass through
+        if vk_code == VK_MENU.0 as i32
+            || vk_code == VK_LMENU.0 as i32
+            || vk_code == VK_RMENU.0 as i32
+        {
+            return CallNextHookEx(None, code, w_param, l_param);
+        }
+
         if CAPS_LOCK_HELD {
             if LOGGING_ENABLED.load(Ordering::SeqCst) {
                 log::debug!("CapsLock is held, checking key: {:#x}", vk_code);
@@ -247,9 +255,11 @@ impl KeyboardManager {
                     SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
                     return LRESULT(1);
                 }
-                _ => {}
+                _ => {
+                    // For unhandled keys when CapsLock is held, pass them through
+                    return CallNextHookEx(None, code, w_param, l_param);
+                }
             }
-            return LRESULT(1);
         }
 
         CallNextHookEx(None, code, w_param, l_param)
