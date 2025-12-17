@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -41,3 +42,35 @@ jobs:
       with:
         name: keys-${{ matrix.os }}
         path: ${{ steps.bin-path.outputs.path }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Release Notes
+        run: |
+          git tag -l --format='%(contents)' ${{ github.ref_name }} > release_notes.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename and Package
+        run: |
+          mkdir release
+          mv artifacts/keys-windows-latest/keys.exe release/keys-windows.exe
+          mv artifacts/keys-macos-latest/keys release/keys-macos
+          chmod +x release/keys-macos
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body_path: release_notes.txt
+          files: |
+            release/keys-windows.exe
+            release/keys-macos
