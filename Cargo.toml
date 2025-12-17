@@ -9,7 +9,7 @@ anyhow = "1.0"
 env_logger = "0.10"
 log = "0.4"
 
-[dependencies.windows]
+[target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.48"
 features = [
     "Win32_UI_Input_KeyboardAndMouse",
@@ -20,6 +20,11 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Console"
 ]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rdev = "0.5"
+tray-icon = "0.14"
+tao = "0.24"
 
 [build-dependencies]
 embed-resource = "1.5.0"

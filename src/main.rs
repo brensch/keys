@@ -1,16 +1,13 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use anyhow::Result;
 use log::info;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
-mod keyboard;
-mod tray;
+mod platform;
 
-use keyboard::KeyboardManager;
-use tray::TrayManager;
+use platform::{KeyboardManager, TrayManager, run_event_loop};
 
 fn main() -> Result<()> {
     std::env::set_var("RUST_LOG", "debug");
@@ -28,14 +25,7 @@ fn main() -> Result<()> {
     info!("Keyboard hook installed");
 
     // Message loop
-    let mut msg = MSG::default();
-    unsafe {
-        info!("Entering message loop");
-        while running.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
+    run_event_loop(running);
 
     Ok(())
 }
