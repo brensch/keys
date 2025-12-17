@@ -36,7 +36,7 @@ fn callback(event: Event) -> Option<Event> {
                     Key::KeyL => Some(Key::RightArrow),
                     Key::KeyH => Some(Key::Home), // Assuming Home exists
                     Key::SemiColon => Some(Key::End), // Assuming End exists
-                    Key::KeyW => Some(Key::VolumeUp), // Assuming VolumeUp exists
+                    // Key::KeyW => Some(Key::VolumeUp), // VolumeUp not available in rdev 0.5
                     _ => None,
                 };
 
@@ -65,7 +65,7 @@ fn callback(event: Event) -> Option<Event> {
                     Key::KeyL => Some(Key::RightArrow),
                     Key::KeyH => Some(Key::Home),
                     Key::SemiColon => Some(Key::End),
-                    Key::KeyW => Some(Key::VolumeUp),
+                    // Key::KeyW => Some(Key::VolumeUp),
                     _ => None,
                 };
 

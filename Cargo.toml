@@ -23,7 +23,7 @@ features = [
 ]
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rdev = "0.5"
+rdev = { version = "0.5", features = ["unstable_grab"] }
 
 [build-dependencies]
 embed-resource = "1.5.0"
