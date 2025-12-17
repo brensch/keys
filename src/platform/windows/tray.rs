@@ -8,6 +8,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Dwm::*;
+use log::info;
 
 pub struct TrayManager {
     hwnd: HWND,
@@ -107,6 +108,35 @@ impl TrayManager {
                 WM_CREATE => {
                     let create_struct = &*(lparam.0 as *const CREATESTRUCTW);
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, create_struct.lpCreateParams as isize);
+                    
+                    let hinstance = create_struct.hInstance;
+
+                    // Edit Control (ID: 101)
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        PCWSTR(wide_string("EDIT").as_ptr()),
+                        None,
+                        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL) as u32),
+                        50, 50, 200, 25,
+                        hwnd,
+                        HMENU(101),
+                        hinstance,
+                        None
+                    );
+
+                    // Button Control (ID: 102)
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        PCWSTR(wide_string("BUTTON").as_ptr()),
+                        PCWSTR(wide_string("Refresh").as_ptr()),
+                        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                        50, 100, 100, 30,
+                        hwnd,
+                        HMENU(102),
+                        hinstance,
+                        None
+                    );
+
                     LRESULT(0)
                 }
                 v if v == WM_USER + 1 => {
@@ -154,26 +184,12 @@ impl TrayManager {
                         DefWindowProcW(hwnd, msg, wparam, lparam)
                     }
                 }
-                WM_PAINT => {
-                    let mut ps = PAINTSTRUCT::default();
-                    let hdc = BeginPaint(hwnd, &mut ps);
-                    
-                    let mut text = wide_string("yo no caps");
-                    let mut rect = RECT::default();
-                    GetClientRect(hwnd, &mut rect);
-                    
-                    SetBkMode(hdc, TRANSPARENT);
-                    SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White color
-                    
-                    DrawTextW(
-                        hdc,
-                        &mut text,
-                        &mut rect,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE
-                    );
-                    
-                    EndPaint(hwnd, &ps);
-                    LRESULT(0)
+                WM_COMMAND => {
+                    let id = (wparam.0 & 0xFFFF) as isize;
+                    if id == 102 { // Refresh button
+                        info!("Refresh clicked");
+                    }
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
                 }
                 WM_DESTROY => {
                     let data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayWindowData;
