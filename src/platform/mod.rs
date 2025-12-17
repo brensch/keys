@@ -11,7 +11,3 @@ pub use windows::run_event_loop;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::keyboard::KeyboardManager;
-#[cfg(target_os = "macos")]
-pub use macos::tray::TrayManager;
-#[cfg(target_os = "macos")]
-pub use macos::run_event_loop;

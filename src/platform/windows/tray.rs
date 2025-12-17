@@ -6,6 +6,8 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::Dwm::*;
 
 pub struct TrayManager {
     hwnd: HWND,
@@ -28,6 +30,7 @@ impl TrayManager {
                 hInstance: hinstance,
                 lpszClassName: PCWSTR(class_name.as_ptr()),
                 hIcon: hicon,
+                hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
                 ..Default::default()
             };
 
@@ -41,7 +44,7 @@ impl TrayManager {
                 WINDOW_EX_STYLE(0),
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(wide_string("keys").as_ptr()),
-                WS_OVERLAPPEDWINDOW,
+                WS_OVERLAPPEDWINDOW & !WS_MAXIMIZEBOX,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 400,
@@ -58,6 +61,15 @@ impl TrayManager {
                 DestroyIcon(hicon);
                 return Err(anyhow!("Failed to create window"));
             }
+
+            // Enable dark mode for title bar
+            let dark_mode = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark_mode as *const _ as *const _,
+                std::mem::size_of::<i32>() as u32,
+            );
 
             ShowWindow(hwnd, SW_HIDE);
 
@@ -98,7 +110,8 @@ impl TrayManager {
                     LRESULT(0)
                 }
                 v if v == WM_USER + 1 => {
-                    if lparam.0 as u32 == WM_RBUTTONUP {
+                    let msg_id = lparam.0 as u32;
+                    if msg_id == WM_RBUTTONUP {
                         let mut point = POINT::default();
                         GetCursorPos(&mut point);
 
@@ -133,9 +146,34 @@ impl TrayManager {
 
                         DestroyMenu(menu);
                         LRESULT(0)
+                    } else if msg_id == WM_LBUTTONUP {
+                        ShowWindow(hwnd, SW_SHOW);
+                        SetForegroundWindow(hwnd);
+                        LRESULT(0)
                     } else {
                         DefWindowProcW(hwnd, msg, wparam, lparam)
                     }
+                }
+                WM_PAINT => {
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    
+                    let mut text = wide_string("yo no caps");
+                    let mut rect = RECT::default();
+                    GetClientRect(hwnd, &mut rect);
+                    
+                    SetBkMode(hdc, TRANSPARENT);
+                    SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White color
+                    
+                    DrawTextW(
+                        hdc,
+                        &mut text,
+                        &mut rect,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE
+                    );
+                    
+                    EndPaint(hwnd, &ps);
+                    LRESULT(0)
                 }
                 WM_DESTROY => {
                     let data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayWindowData;

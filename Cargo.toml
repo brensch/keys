@@ -17,14 +17,13 @@ features = [
     "Win32_Foundation",
     "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
     "Win32_System_Console"
 ]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rdev = "0.5"
-tray-icon = "0.14"
-tao = "0.24"
 
 [build-dependencies]
 embed-resource = "1.5.0"
