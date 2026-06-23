@@ -45,7 +45,8 @@ fn embed_windows_icon(out_dir: &Path, source: &image::DynamicImage) {
     fs::write(&icon_path, bytes.into_inner()).expect("write application icon");
 
     let rc_path = out_dir.join("nocaps.rc");
-    fs::write(&rc_path, format!("1 ICON \"{}\"\n", icon_path.display()))
+    let resource_icon_path = icon_path.to_string_lossy().replace('\\', "/");
+    fs::write(&rc_path, format!("1 ICON \"{resource_icon_path}\"\n"))
         .expect("write resource script");
     embed_resource::compile(rc_path);
 }
