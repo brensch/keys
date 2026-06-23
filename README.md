@@ -44,6 +44,8 @@ JSON and validation run only at startup or when a binding changes. Valid binding
 
 Remapping input processing never runs on the renderer thread. Windows installs the low-level hook on a dedicated `THREAD_PRIORITY_HIGHEST` Win32 message-loop thread. Linux keyboard-device workers and the macOS capture worker request realtime/high scheduling priority and continue at normal priority with a warning if the OS denies that request. Linux realtime priority generally requires `CAP_SYS_NICE` or an equivalent service limit.
 
+The configuration window is event-driven and does not poll. The egui loop repaints only in response to window input or a tray activation: tray menu clicks are delivered through a handler that wakes the UI thread, so while the window sits hidden in the tray the process stays idle instead of repainting on a timer. Linux is the one exception — its AppIndicator menu only emits events while the GTK main loop is iterated, so the window keeps a low-frequency tick to drive that pump.
+
 ## Platform setup
 
 ### Windows
