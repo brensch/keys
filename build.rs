@@ -16,7 +16,7 @@ fn main() {
         .decode()
         .expect("decode nocaps icon");
     let window_icon = source
-        .resize_exact(WINDOW_ICON_SIZE, WINDOW_ICON_SIZE, FilterType::Lanczos3)
+        .resize_exact(WINDOW_ICON_SIZE, WINDOW_ICON_SIZE, FilterType::Nearest)
         .into_rgba8();
     fs::write(out_dir.join("nocaps.rgba"), window_icon.as_raw())
         .expect("write generated window icon");
@@ -30,7 +30,7 @@ fn embed_windows_icon(out_dir: &Path, source: &image::DynamicImage) {
     let mut directory = ico::IconDir::new(ico::ResourceType::Icon);
     for size in [16, 24, 32, 48, 64, 128, 256] {
         let rgba = source
-            .resize_exact(size, size, FilterType::Lanczos3)
+            .resize_exact(size, size, FilterType::Nearest)
             .into_rgba8()
             .into_raw();
         let image = ico::IconImage::from_rgba_data(size, size, rgba);
