@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "enabled": true,
+  "bindings": {
+    "left_control": "a",
+    "left_shift": "s",
+    "arrow_up": "i",
+    "arrow_down": "k",
+    "arrow_left": "j",
+    "arrow_right": "l",
+    "home": "h",
+    "end": "semicolon",
+    "backspace": "u",
+    "delete": "o",
+    "volume_up": "w",
+    "volume_down": "q",
+    "volume_mute": "tab",
+    "media_previous": "e",
+    "media_play_pause": "r",
+    "media_next": "t"
+  }
+}
