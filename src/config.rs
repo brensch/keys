@@ -264,8 +264,8 @@ impl Action {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::LeftControl => "Control",
-            Self::LeftShift => "Shift",
+            Self::LeftControl => "Word jump",
+            Self::LeftShift => "Select",
             Self::LeftAlt => "Alt / Option",
             Self::LeftMeta => "Windows / Command",
             Self::ArrowUp => "Up arrow",
@@ -300,9 +300,24 @@ impl Action {
         }
     }
 
+    /// What an action actually sends, where its label alone doesn't say.
+    pub fn hint(self) -> Option<&'static str> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::LeftControl => {
+                Some("Option with arrows, Backspace and Delete; Command with Home and End")
+            }
+            #[cfg(not(target_os = "macos"))]
+            Self::LeftControl => Some("Sends Control"),
+            Self::LeftShift => Some("Sends Shift"),
+            _ => None,
+        }
+    }
+
     pub fn category(self) -> &'static str {
         match self {
-            Self::LeftControl | Self::LeftShift | Self::LeftAlt | Self::LeftMeta => "Modifiers",
+            Self::LeftControl | Self::LeftShift => "With movement",
+            Self::LeftAlt | Self::LeftMeta => "Modifiers",
             Self::ArrowUp
             | Self::ArrowDown
             | Self::ArrowLeft

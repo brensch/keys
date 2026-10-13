@@ -24,11 +24,11 @@ Hold **Caps Lock** and press a bound key. Caps Lock itself never toggles while n
 
 | Hold Caps Lock + | Does | | Hold Caps Lock + | Does |
 | :-: | --- | --- | :-: | --- |
-| <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> | ↑ ← ↓ → | | <kbd>A</kbd> / <kbd>S</kbd> | Control / Shift |
+| <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> | ↑ ← ↓ → | | <kbd>A</kbd> / <kbd>S</kbd> + a movement key | Word jump / Select |
 | <kbd>H</kbd> / <kbd>;</kbd> | Home / End | | <kbd>Q</kbd> / <kbd>W</kbd> / <kbd>Tab</kbd> | Volume down / up / mute |
 | <kbd>U</kbd> / <kbd>O</kbd> | Backspace / Delete | | <kbd>E</kbd> / <kbd>R</kbd> / <kbd>T</kbd> | Previous / play-pause / next |
 
-Combine freely: Caps Lock + <kbd>S</kbd> + <kbd>J</kbd> is Shift+←, and Caps Lock + <kbd>A</kbd> + <kbd>C</kbd> is Ctrl+C.
+Combine freely: Caps Lock + <kbd>A</kbd> + <kbd>J</kbd> jumps a word left, and adding <kbd>S</kbd> selects it. Combos do the same thing on every OS: on macOS words use Option and Home/End become Cmd+←/→.
 
 nocaps runs in the system tray. Choose **Configure** to rebind: click a key, press the new one, and it is applied and saved instantly.
 

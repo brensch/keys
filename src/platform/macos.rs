@@ -9,6 +9,10 @@
 //! the tap. Modifier actions are applied by adding their flags to every keyboard and
 //! mouse event that passes through the tap, because macOS does not merge synthesized
 //! modifier state into events from physical keys.
+//!
+//! Layered keys mean on macOS what they mean on Windows. The Control action is a word
+//! modifier here: Caps Lock + A + J sends Option+Left (word left) rather than Ctrl+Left,
+//! which macOS uses to switch Spaces. Home and End become the Command-arrow line jumps.
 
 use crate::config::{Action, InputKey, BINDINGS};
 use anyhow::{anyhow, Context, Result};
@@ -39,7 +43,6 @@ const HID_F18: u64 = 0x7_0000_006D;
 const KEYCODE_F18: CGKeyCode = 0x4F;
 
 // Device-dependent bits identify the left-hand modifier, as a physical key press does.
-const LEFT_CONTROL_FLAGS: u64 = CGEventFlags::CGEventFlagControl.bits() | 0x0000_0001;
 const LEFT_SHIFT_FLAGS: u64 = CGEventFlags::CGEventFlagShift.bits() | 0x0000_0002;
 const LEFT_COMMAND_FLAGS: u64 = CGEventFlags::CGEventFlagCommand.bits() | 0x0000_0008;
 const LEFT_OPTION_FLAGS: u64 = CGEventFlags::CGEventFlagAlternate.bits() | 0x0000_0020;
@@ -174,7 +177,10 @@ fn run_tap_thread(ready: mpsc::SyncSender<Result<(), String>>) {
 
 #[derive(Clone, Copy)]
 enum Held {
-    /// The source key triggered this action and its release must release the action.
+    /// A layered key, translated once when pressed so its repeats and its release send
+    /// the same keystroke even if the word modifier changes in between.
+    Key { code: CGKeyCode, flags: u64 },
+    /// A modifier, word or media action whose release must release it.
     Action(Action),
     /// The action was already released when the layer key went up; swallow the rest of
     /// this physical press so the application never sees an unmatched key-up.
@@ -185,6 +191,8 @@ struct TapState {
     source: CGEventSource,
     enigo: Enigo,
     layer_held: bool,
+    /// Caps Lock + the Control action's key is held: movement and deletion go by words.
+    word_held: bool,
     layer_flags: u64,
     held: [Option<Held>; InputKey::COUNT],
     /// Number of `Some` entries in `held`, so the idle fast path needs no scan.
@@ -204,6 +212,7 @@ impl TapState {
             source,
             enigo,
             layer_held: false,
+            word_held: false,
             layer_flags: 0,
             held: [None; InputKey::COUNT],
             held_count: 0,
@@ -261,6 +270,16 @@ impl TapState {
         };
         let slot = &mut self.held[key.index()];
         match (*slot, down) {
+            (Some(Held::Key { code, flags: extra }), true) => {
+                self.post_layered_key(proxy, code, extra, true, repeat, flags);
+                CallbackResult::Drop
+            }
+            (Some(Held::Key { code, flags: extra }), false) => {
+                *slot = None;
+                self.held_count -= 1;
+                self.post_layered_key(proxy, code, extra, false, false, flags);
+                CallbackResult::Drop
+            }
             (Some(Held::Action(action)), true) => {
                 self.emit(proxy, action, true, repeat, flags);
                 CallbackResult::Drop
@@ -280,9 +299,15 @@ impl TapState {
             }
             (None, true) if self.layer_held && !repeat => match BINDINGS.action_for(key) {
                 Some(action) => {
-                    *slot = Some(Held::Action(action));
                     self.held_count += 1;
-                    self.emit(proxy, action, true, false, flags);
+                    if let MacOutput::Key(code) = mac_output(action) {
+                        let (code, extra) = mac_keystroke(code, self.word_held);
+                        *slot = Some(Held::Key { code, flags: extra });
+                        self.post_layered_key(proxy, code, extra, true, false, flags);
+                    } else {
+                        *slot = Some(Held::Action(action));
+                        self.emit(proxy, action, true, false, flags);
+                    }
                     CallbackResult::Drop
                 }
                 None => self.pass_through(event),
@@ -292,7 +317,7 @@ impl TapState {
     }
 
     /// Physical events keep flowing while a layer modifier is held; add its flags so
-    /// that, for example, Caps Lock + A followed by C acts as Control+C.
+    /// that, for example, Caps Lock + S followed by a letter types a capital.
     fn pass_through(&self, event: &CGEvent) -> CallbackResult {
         if self.layer_flags != 0 {
             let flags = event.get_flags().bits() | self.layer_flags;
@@ -303,9 +328,16 @@ impl TapState {
 
     fn release_all(&mut self, proxy: CGEventTapProxy, flags: u64) {
         for index in 0..InputKey::COUNT {
-            if let Some(Held::Action(action)) = self.held[index] {
-                self.held[index] = Some(Held::Released);
-                self.emit(proxy, action, false, false, flags);
+            match self.held[index] {
+                Some(Held::Key { code, flags: extra }) => {
+                    self.held[index] = Some(Held::Released);
+                    self.post_layered_key(proxy, code, extra, false, false, flags);
+                }
+                Some(Held::Action(action)) => {
+                    self.held[index] = Some(Held::Released);
+                    self.emit(proxy, action, false, false, flags);
+                }
+                Some(Held::Released) | None => {}
             }
         }
     }
@@ -320,10 +352,12 @@ impl TapState {
     ) {
         match mac_output(action) {
             MacOutput::Key(code) => {
-                let flags = (physical_flags & !KEY_SPECIFIC_FLAGS)
-                    | self.layer_flags
-                    | key_specific_flags(code);
-                self.post_key(proxy, code, down, repeat, CGEventType::KeyDown, flags);
+                self.post_layered_key(proxy, code, 0, down, repeat, physical_flags);
+            }
+            MacOutput::Word => {
+                if !repeat {
+                    self.word_held = down;
+                }
             }
             MacOutput::Modifier(code, modifier_flags) => {
                 if repeat {
@@ -347,6 +381,24 @@ impl TapState {
                 }
             }
         }
+    }
+
+    /// Sends a layered key with the physical modifiers, the layer's modifiers, the
+    /// translation's own modifiers, and the flags macOS attaches to that key.
+    fn post_layered_key(
+        &self,
+        proxy: CGEventTapProxy,
+        code: CGKeyCode,
+        extra_flags: u64,
+        down: bool,
+        repeat: bool,
+        physical_flags: u64,
+    ) {
+        let flags = (physical_flags & !KEY_SPECIFIC_FLAGS)
+            | self.layer_flags
+            | extra_flags
+            | key_specific_flags(code);
+        self.post_key(proxy, code, down, repeat, CGEventType::KeyDown, flags);
     }
 
     fn post_key(
@@ -501,33 +553,68 @@ extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
 }
 
+// macOS virtual key codes (`kVK_*`) for the keys nocaps sends.
+const KEY_RETURN: CGKeyCode = 0x24;
+const KEY_TAB: CGKeyCode = 0x30;
+const KEY_SPACE: CGKeyCode = 0x31;
+const KEY_BACKSPACE: CGKeyCode = 0x33;
+const KEY_ESCAPE: CGKeyCode = 0x35;
+const KEY_HOME: CGKeyCode = 0x73;
+const KEY_PAGE_UP: CGKeyCode = 0x74;
+const KEY_FORWARD_DELETE: CGKeyCode = 0x75;
+const KEY_END: CGKeyCode = 0x77;
+const KEY_PAGE_DOWN: CGKeyCode = 0x79;
+const KEY_LEFT: CGKeyCode = 0x7B;
+const KEY_RIGHT: CGKeyCode = 0x7C;
+const KEY_DOWN: CGKeyCode = 0x7D;
+const KEY_UP: CGKeyCode = 0x7E;
+
+/// Translates a layered key into the Mac keystroke that does what the same combination
+/// does on Windows, returning the key and the modifiers to add.
+fn mac_keystroke(code: CGKeyCode, word: bool) -> (CGKeyCode, u64) {
+    match (code, word) {
+        // Line start/end, and document start/end with the word modifier.
+        (KEY_HOME, false) => (KEY_LEFT, LEFT_COMMAND_FLAGS),
+        (KEY_END, false) => (KEY_RIGHT, LEFT_COMMAND_FLAGS),
+        (KEY_HOME, true) => (KEY_UP, LEFT_COMMAND_FLAGS),
+        (KEY_END, true) => (KEY_DOWN, LEFT_COMMAND_FLAGS),
+        // Move or delete by word (left/right) or by paragraph (up/down).
+        (KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN | KEY_BACKSPACE | KEY_FORWARD_DELETE, true) => {
+            (code, LEFT_OPTION_FLAGS)
+        }
+        _ => (code, 0),
+    }
+}
+
 enum MacOutput {
     Key(CGKeyCode),
+    /// Changes how layered movement keys are translated; sends nothing by itself.
+    Word,
     Modifier(CGKeyCode, u64),
     Media(EnigoKey),
 }
 
 fn mac_output(action: Action) -> MacOutput {
-    use MacOutput::{Key, Media, Modifier};
+    use MacOutput::{Key, Media, Modifier, Word};
     match action {
-        Action::LeftControl => Modifier(0x3B, LEFT_CONTROL_FLAGS),
+        Action::LeftControl => Word,
         Action::LeftShift => Modifier(0x38, LEFT_SHIFT_FLAGS),
         Action::LeftAlt => Modifier(0x3A, LEFT_OPTION_FLAGS),
         Action::LeftMeta => Modifier(0x37, LEFT_COMMAND_FLAGS),
-        Action::ArrowUp => Key(0x7E),
-        Action::ArrowDown => Key(0x7D),
-        Action::ArrowLeft => Key(0x7B),
-        Action::ArrowRight => Key(0x7C),
-        Action::Home => Key(0x73),
-        Action::End => Key(0x77),
-        Action::PageUp => Key(0x74),
-        Action::PageDown => Key(0x79),
-        Action::Backspace => Key(0x33),
-        Action::Delete => Key(0x75),
-        Action::Enter => Key(0x24),
-        Action::Escape => Key(0x35),
-        Action::Tab => Key(0x30),
-        Action::Space => Key(0x31),
+        Action::ArrowUp => Key(KEY_UP),
+        Action::ArrowDown => Key(KEY_DOWN),
+        Action::ArrowLeft => Key(KEY_LEFT),
+        Action::ArrowRight => Key(KEY_RIGHT),
+        Action::Home => Key(KEY_HOME),
+        Action::End => Key(KEY_END),
+        Action::PageUp => Key(KEY_PAGE_UP),
+        Action::PageDown => Key(KEY_PAGE_DOWN),
+        Action::Backspace => Key(KEY_BACKSPACE),
+        Action::Delete => Key(KEY_FORWARD_DELETE),
+        Action::Enter => Key(KEY_RETURN),
+        Action::Escape => Key(KEY_ESCAPE),
+        Action::Tab => Key(KEY_TAB),
+        Action::Space => Key(KEY_SPACE),
         Action::VolumeUp => Media(EnigoKey::VolumeUp),
         Action::VolumeDown => Media(EnigoKey::VolumeDown),
         Action::VolumeMute => Media(EnigoKey::VolumeMute),
@@ -541,8 +628,10 @@ fn mac_output(action: Action) -> MacOutput {
 /// applications only recognize arrow and navigation keys that carry them.
 fn key_specific_flags(code: CGKeyCode) -> u64 {
     match code {
-        0x7B..=0x7E => KEY_SPECIFIC_FLAGS,
-        0x73 | 0x74 | 0x75 | 0x77 | 0x79 => CGEventFlags::CGEventFlagSecondaryFn.bits(),
+        KEY_LEFT | KEY_RIGHT | KEY_DOWN | KEY_UP => KEY_SPECIFIC_FLAGS,
+        KEY_HOME | KEY_PAGE_UP | KEY_FORWARD_DELETE | KEY_END | KEY_PAGE_DOWN => {
+            CGEventFlags::CGEventFlagSecondaryFn.bits()
+        }
         _ => 0,
     }
 }
@@ -652,6 +741,22 @@ mod tests {
             vec![(HID_CAPS_LOCK, HID_F18), (0x7_0000_00E4, 0x7_0000_0029)]
         );
         assert!(parse_hid_mapping("(null)\n").is_empty());
+    }
+
+    #[test]
+    fn layered_keys_translate_to_mac_equivalents() {
+        assert_eq!(mac_keystroke(KEY_LEFT, false), (KEY_LEFT, 0));
+        assert_eq!(mac_keystroke(KEY_LEFT, true), (KEY_LEFT, LEFT_OPTION_FLAGS));
+        assert_eq!(
+            mac_keystroke(KEY_BACKSPACE, true),
+            (KEY_BACKSPACE, LEFT_OPTION_FLAGS)
+        );
+        assert_eq!(
+            mac_keystroke(KEY_HOME, false),
+            (KEY_LEFT, LEFT_COMMAND_FLAGS)
+        );
+        assert_eq!(mac_keystroke(KEY_END, true), (KEY_DOWN, LEFT_COMMAND_FLAGS));
+        assert_eq!(mac_keystroke(KEY_RETURN, true), (KEY_RETURN, 0));
     }
 
     #[test]

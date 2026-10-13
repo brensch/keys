@@ -295,11 +295,14 @@ impl NocapsApp {
         let binding = self.config.key_for(action);
         ui.horizontal(|ui| {
             ui.set_min_height(21.0);
-            ui.label(
+            let label = ui.label(
                 egui::RichText::new(action.label())
                     .size(12.5)
                     .color(if capturing { CORAL } else { INK }),
             );
+            if let Some(hint) = action.hint() {
+                label.on_hover_text(hint);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Always allocated so every keycap lines up, bound or not.
                 let clear = ui.add_visible(
@@ -326,6 +329,38 @@ impl NocapsApp {
     }
 
     fn category_block(&mut self, ui: &mut egui::Ui, title: &str) {
+        self.card(ui, title, |app, ui| app.category_rows(ui, title));
+    }
+
+    /// Navigation keys, followed by the modifiers that only matter alongside them.
+    fn navigation_block(&mut self, ui: &mut egui::Ui) {
+        self.card(ui, "Navigation", |app, ui| {
+            app.category_rows(ui, "Navigation");
+            ui.add_space(4.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("With movement")
+                        .font(bold(12.0))
+                        .color(INK),
+                );
+                ui.label(
+                    egui::RichText::new("hold with a key above")
+                        .size(11.5)
+                        .color(MUTED),
+                );
+            });
+            ui.add_space(1.0);
+            app.category_rows(ui, "With movement");
+        });
+    }
+
+    fn card(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        body: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
         egui::Frame::new()
             .fill(CARD)
             .stroke(egui::Stroke::new(1.0_f32, RULE))
@@ -335,15 +370,19 @@ impl NocapsApp {
                 ui.set_width(ui.available_width());
                 ui.label(egui::RichText::new(title).font(bold(13.0)).color(INK));
                 ui.add_space(3.0);
-                for action in Action::ALL
-                    .iter()
-                    .copied()
-                    .filter(|action| action.category() == title)
-                {
-                    self.action_row(ui, action);
-                }
+                body(self, ui);
             });
         ui.add_space(10.0);
+    }
+
+    fn category_rows(&mut self, ui: &mut egui::Ui, category: &str) {
+        for action in Action::ALL
+            .iter()
+            .copied()
+            .filter(|action| action.category() == category)
+        {
+            self.action_row(ui, action);
+        }
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
@@ -492,8 +531,8 @@ impl eframe::App for NocapsApp {
             )
             .show_inside(ui, |ui| {
                 ui.columns(2, |columns| {
+                    self.navigation_block(&mut columns[0]);
                     self.category_block(&mut columns[0], "Modifiers");
-                    self.category_block(&mut columns[0], "Navigation");
                     self.category_block(&mut columns[1], "Editing");
                     self.category_block(&mut columns[1], "Volume");
                     self.category_block(&mut columns[1], "Media");
