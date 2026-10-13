@@ -40,7 +40,13 @@ Each action can have one key and each key can have one action. Unknown versions 
 
 ## Performance model
 
-JSON and validation run only at startup or when a binding changes. Valid bindings are compiled into a fixed-size array indexed by physical key and published with an atomic pointer swap. Keyboard hooks perform no JSON parsing, hash lookups, linear searches, allocations, or configuration locks. Platform modules only translate native input codes to the shared physical-key enum and shared actions back to native output codes.
+JSON and validation run only at startup or when a binding changes. Valid bindings are written into a static table with one atomic byte per physical key, so a hook lookup is a single relaxed load: no locks, reference counts, pointer chasing, hashing, searching, or allocation. Platform modules only translate native input codes to the shared physical-key enum and shared actions back to native output codes.
+
+Each platform uses the lowest-level interface available without installing a kernel driver:
+
+- **Windows:** a raw `WH_KEYBOARD_LL` hook. The hook runs on one thread, so its state uses relaxed atomics that compile to plain moves, with no locked instructions on the hot path.
+- **macOS:** a `CGEventTap` called directly through Core Graphics. While no layer key or layered key is held, a keystroke costs one field read before the event is handed back.
+- **Linux:** evdev raw devices and uinput. Each keyboard worker performs one blocking `read` and at most one `write` per batch of kernel events, forwarding the kernel's own frame markers, and writes through its own uinput handle so workers share no lock.
 
 Remapping input processing never runs on the renderer thread. Windows installs the low-level hook on a dedicated `THREAD_PRIORITY_HIGHEST` Win32 message-loop thread. Linux keyboard-device workers and the macOS capture worker request realtime/high scheduling priority and continue at normal priority with a warning if the OS denies that request. Linux realtime priority generally requires `CAP_SYS_NICE` or an equivalent service limit.
 
@@ -54,7 +60,9 @@ No additional runtime setup is required. To launch at sign-in, place `nocaps.exe
 
 ### macOS
 
-Grant `nocaps` access in **System Settings → Privacy & Security → Accessibility**.
+Grant `nocaps` access in **System Settings → Privacy & Security → Accessibility**. macOS shows the prompt on first launch; restart `nocaps` after granting it.
+
+macOS latches Caps Lock in the HID driver, below any event tap, so the key cannot be suppressed in software alone. While remapping is enabled, `nocaps` uses `hidutil` to remap Caps Lock to F18 and treats F18 as the layer key. Disabling remapping or quitting restores your previous `hidutil` key mapping, including on Ctrl+C or `SIGTERM`. If the process is force-killed, Caps Lock stays mapped to F18 until the next launch or reboot. `nocaps` runs without a Dock icon.
 
 ### Linux
 
@@ -83,3 +91,8 @@ cargo build --release
 ```
 
 The executable is `target/release/nocaps` (`nocaps.exe` on Windows). CI builds and tests Windows, macOS, and Linux.
+
+## Credits
+
+- Icon cap: [Twemoji](https://github.com/jdecked/twemoji) U+1F9E2, © Twitter/X and contributors, [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Source: `assets/nocaps-icon.svg`.
+- Font: [Inter](https://github.com/rsms/inter), SIL Open Font License 1.1 (`assets/Inter-LICENSE.txt`).

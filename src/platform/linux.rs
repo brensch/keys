@@ -1,21 +1,27 @@
-use crate::config::{Action, InputKey, RuntimeBindings};
+use crate::config::{Action, InputKey, BINDINGS};
 use anyhow::{anyhow, Context, Result};
+use evdev::raw_stream::RawDevice;
 use evdev::uinput::VirtualDevice;
-use evdev::{AttributeSet, Device, EventType, InputEvent, KeyCode};
+use evdev::{AttributeSet, EventType, InputEvent, KeyCode, SynchronizationCode};
 use log::{error, info};
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+/// Caps Lock held on any keyboard activates the layer on every keyboard.
 static LAYER_HOLDERS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct KeyboardManager {
+    _virtual_keyboard: VirtualDevice,
     _threads: Vec<JoinHandle<()>>,
 }
 
 impl KeyboardManager {
-    pub fn new(runtime: Arc<RuntimeBindings>) -> Result<Self> {
-        let mut devices: Vec<Device> = evdev::enumerate()
+    pub fn new() -> Result<Self> {
+        // Raw devices skip evdev's per-event key-state bookkeeping, which nocaps never reads.
+        let mut devices: Vec<RawDevice> = evdev::raw_stream::enumerate()
             .map(|(_, device)| device)
             .filter(is_keyboard)
             .collect();
@@ -45,7 +51,6 @@ impl KeyboardManager {
             .context("configure virtual keyboard")?
             .build()
             .context("create virtual keyboard")?;
-        let virtual_keyboard = Arc::new(Mutex::new(virtual_keyboard));
 
         for device in &mut devices {
             device
@@ -55,23 +60,32 @@ impl KeyboardManager {
 
         let mut threads = Vec::with_capacity(devices.len());
         for device in devices {
-            let runtime = runtime.clone();
-            let output = virtual_keyboard.clone();
+            // Each worker writes through its own handle to the virtual keyboard: uinput
+            // accepts whole events per write, so the workers never need to share a lock.
+            let output = File::from(
+                virtual_keyboard
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .context("duplicate the virtual keyboard handle")?,
+            );
             let name = device.name().unwrap_or("keyboard").to_owned();
             threads.push(
                 thread::Builder::new()
                     .name(format!("nocaps-{name}"))
-                    .spawn(move || run_device(device, runtime, output, &name))
+                    .spawn(move || run_device(device, output, &name))
                     .context("start Linux keyboard worker")?,
             );
         }
 
         info!("remapping {} Linux keyboard device(s)", threads.len());
-        Ok(Self { _threads: threads })
+        Ok(Self {
+            _virtual_keyboard: virtual_keyboard,
+            _threads: threads,
+        })
     }
 }
 
-fn is_keyboard(device: &Device) -> bool {
+fn is_keyboard(device: &RawDevice) -> bool {
     device.supported_keys().is_some_and(|keys| {
         keys.contains(KeyCode::KEY_CAPSLOCK)
             && keys.contains(KeyCode::KEY_A)
@@ -80,45 +94,47 @@ fn is_keyboard(device: &Device) -> bool {
     })
 }
 
-fn run_device(
-    mut device: Device,
-    runtime: Arc<RuntimeBindings>,
-    output: Arc<Mutex<VirtualDevice>>,
-    name: &str,
-) {
+/// One blocking `read` per batch of kernel events and one `write` per batch of output:
+/// the kernel's own SYN_REPORT frame markers are forwarded instead of adding new ones.
+fn run_device(mut device: RawDevice, mut output: File, name: &str) {
     super::elevate_input_thread();
     let mut held_targets = [None; InputKey::COUNT];
     let mut captured_caps = false;
-    let mut translated = Vec::with_capacity(16);
+    let mut translated = Vec::with_capacity(64);
 
     loop {
         translated.clear();
+        let mut has_keys = false;
         let events = match device.fetch_events() {
             Ok(events) => events,
             Err(error) => {
                 error!("stopped reading {name}: {error}");
-                cleanup_state(captured_caps, &held_targets, &output);
+                cleanup_state(captured_caps, &held_targets, &mut output);
                 return;
             }
         };
 
         for event in events {
-            if event.event_type() != EventType::KEY {
-                continue;
+            match event.event_type() {
+                EventType::KEY => {}
+                EventType::SYNCHRONIZATION if event.code() == SynchronizationCode::SYN_REPORT.0 => {
+                    translated.push(event);
+                    continue;
+                }
+                _ => continue,
             }
 
             let source = KeyCode::new(event.code());
             let value = event.value();
             if source == KeyCode::KEY_CAPSLOCK {
-                let enabled = runtime.is_enabled();
-                if value == 1 && enabled && !captured_caps {
+                if value == 1 && !captured_caps && BINDINGS.is_enabled() {
                     captured_caps = true;
-                    LAYER_HOLDERS.fetch_add(1, Ordering::SeqCst);
+                    LAYER_HOLDERS.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 if value == 0 && captured_caps {
                     captured_caps = false;
-                    LAYER_HOLDERS.fetch_sub(1, Ordering::SeqCst);
+                    LAYER_HOLDERS.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
                 if captured_caps {
@@ -127,38 +143,35 @@ fn run_device(
             }
 
             let input_key = key_from_linux(source);
-            let target = if value == 0 {
-                input_key
+            let target = match value {
+                0 => input_key
                     .and_then(|key| held_targets[key.index()].take())
-                    .unwrap_or(source)
-            } else if value == 2 {
-                input_key
+                    .unwrap_or(source),
+                2 => input_key
                     .and_then(|key| held_targets[key.index()])
-                    .unwrap_or(source)
-            } else if LAYER_HOLDERS.load(Ordering::SeqCst) > 0 {
-                let target = input_key
-                    .and_then(|key| runtime.action_for(key))
-                    .map(linux_action_code)
-                    .unwrap_or(source);
-                if let Some(key) = input_key.filter(|_| target != source) {
-                    held_targets[key.index()] = Some(target);
+                    .unwrap_or(source),
+                _ if LAYER_HOLDERS.load(Ordering::Relaxed) > 0 => {
+                    match input_key.and_then(|key| Some((key, BINDINGS.action_for(key)?))) {
+                        Some((key, action)) => {
+                            let target = linux_action_code(action);
+                            held_targets[key.index()] = Some(target);
+                            target
+                        }
+                        None => source,
+                    }
                 }
-                target
-            } else {
-                source
+                _ => source,
             };
 
+            has_keys = true;
             translated.push(InputEvent::new(EventType::KEY.0, target.code(), value));
         }
 
-        if !translated.is_empty() {
-            let result = output
-                .lock()
-                .map_err(|_| anyhow!("virtual keyboard lock is poisoned"))
-                .and_then(|mut output| output.emit(&translated).context("emit keyboard events"));
-            if let Err(error) = result {
-                error!("stopped writing events for {name}: {error:#}");
-                cleanup_state(captured_caps, &held_targets, &output);
+        // A batch whose only key event was Caps Lock leaves nothing worth writing.
+        if has_keys {
+            if let Err(error) = output.write_all(as_bytes(&translated)) {
+                error!("stopped writing events for {name}: {error}");
+                cleanup_state(captured_caps, &held_targets, &mut output);
                 return;
             }
         }
@@ -168,21 +181,30 @@ fn run_device(
 fn cleanup_state(
     captured_caps: bool,
     held_targets: &[Option<KeyCode>; InputKey::COUNT],
-    output: &Arc<Mutex<VirtualDevice>>,
+    output: &mut File,
 ) {
     if captured_caps {
-        LAYER_HOLDERS.fetch_sub(1, Ordering::SeqCst);
+        LAYER_HOLDERS.fetch_sub(1, Ordering::Relaxed);
     }
-    let releases: Vec<InputEvent> = held_targets
+    let mut releases: Vec<InputEvent> = held_targets
         .iter()
         .flatten()
         .map(|key| InputEvent::new(EventType::KEY.0, key.code(), 0))
         .collect();
     if !releases.is_empty() {
-        if let Ok(mut output) = output.lock() {
-            let _ = output.emit(&releases);
-        }
+        releases.push(InputEvent::new(
+            EventType::SYNCHRONIZATION.0,
+            SynchronizationCode::SYN_REPORT.0,
+            0,
+        ));
+        let _ = output.write_all(as_bytes(&releases));
     }
+}
+
+fn as_bytes(events: &[InputEvent]) -> &[u8] {
+    // SAFETY: `InputEvent` is `#[repr(transparent)]` over the kernel's plain-old-data
+    // `input_event`, which is exactly the record format uinput reads.
+    unsafe { std::slice::from_raw_parts(events.as_ptr().cast(), std::mem::size_of_val(events)) }
 }
 
 fn key_from_linux(code: KeyCode) -> Option<InputKey> {

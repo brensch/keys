@@ -1,11 +1,10 @@
 use anyhow::{anyhow, Context, Result};
-use arc_swap::ArcSwap;
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_CONFIG_JSON: &str = include_str!("../config/default.json");
@@ -292,6 +291,15 @@ impl Action {
         }
     }
 
+    #[inline(always)]
+    const fn from_code(code: u8) -> Option<Self> {
+        if (code as usize) < Self::ALL.len() {
+            Some(Self::ALL[code as usize])
+        } else {
+            None
+        }
+    }
+
     pub fn category(self) -> &'static str {
         match self {
             Self::LeftControl | Self::LeftShift | Self::LeftAlt | Self::LeftMeta => "Modifiers",
@@ -312,18 +320,6 @@ impl Action {
             Self::VolumeUp | Self::VolumeDown | Self::VolumeMute => "Volume",
             Self::MediaPrevious | Self::MediaPlayPause | Self::MediaNext => "Media",
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub const fn held_code(self) -> u8 {
-        self as u8 + 1
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn from_held_code(code: u8) -> Option<Self> {
-        code.checked_sub(1)
-            .and_then(|index| Self::ALL.get(index as usize))
-            .copied()
     }
 }
 
@@ -378,50 +374,52 @@ impl Config {
     }
 }
 
-struct CompiledBindings {
-    enabled: bool,
-    actions: [Option<Action>; InputKey::COUNT],
-}
+/// The bindings the keyboard hooks read on every key event.
+///
+/// Each physical key owns one atomic byte holding its action's discriminant, so a lookup
+/// is a single relaxed load from a static table: no locks, no reference counting, no
+/// pointer chasing. Updates happen only when the user edits a binding; a hook racing an
+/// update sees each key's old or new action, which is indistinguishable from pressing
+/// the key a moment earlier or later.
+pub static BINDINGS: RuntimeBindings = RuntimeBindings::new();
 
-impl CompiledBindings {
-    fn new(config: &Config) -> Result<Self> {
-        config.validate()?;
-        let mut actions = [None; InputKey::COUNT];
-        if config.enabled {
-            for (action, key) in &config.bindings {
-                actions[key.index()] = Some(*action);
-            }
-        }
-        Ok(Self {
-            enabled: config.enabled,
-            actions,
-        })
-    }
-}
-
-/// Lock-free runtime view used by keyboard hooks. JSON is never consulted on the hot path.
 pub struct RuntimeBindings {
-    compiled: ArcSwap<CompiledBindings>,
+    enabled: AtomicBool,
+    actions: [AtomicU8; InputKey::COUNT],
 }
+
+const NO_ACTION: u8 = u8::MAX;
 
 impl RuntimeBindings {
-    pub fn new(config: &Config) -> Result<Self> {
-        Ok(Self {
-            compiled: ArcSwap::from_pointee(CompiledBindings::new(config)?),
-        })
+    pub const fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            actions: [const { AtomicU8::new(NO_ACTION) }; InputKey::COUNT],
+        }
     }
 
+    #[inline(always)]
     pub fn action_for(&self, key: InputKey) -> Option<Action> {
-        self.compiled.load().actions[key.index()]
+        Action::from_code(self.actions[key.index()].load(Ordering::Relaxed))
     }
 
+    #[inline(always)]
     pub fn is_enabled(&self) -> bool {
-        self.compiled.load().enabled
+        self.enabled.load(Ordering::Relaxed)
     }
 
-    pub fn replace(&self, config: &Config) -> Result<()> {
-        self.compiled
-            .store(Arc::new(CompiledBindings::new(config)?));
+    pub fn apply(&self, config: &Config) -> Result<()> {
+        config.validate()?;
+        let mut actions = [NO_ACTION; InputKey::COUNT];
+        if config.enabled {
+            for (action, key) in &config.bindings {
+                actions[key.index()] = *action as u8;
+            }
+        }
+        for (slot, action) in self.actions.iter().zip(actions) {
+            slot.store(action, Ordering::Relaxed);
+        }
+        self.enabled.store(config.enabled, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -467,8 +465,13 @@ impl ConfigStore {
             .ok_or_else(|| anyhow!("configuration path has no parent"))?;
         fs::create_dir_all(parent)
             .with_context(|| format!("create configuration directory {}", parent.display()))?;
-        fs::write(&self.path, serde_json::to_vec_pretty(config)?)
-            .with_context(|| format!("write configuration to {}", self.path.display()))
+        // Write a sibling file and rename it over the original so an interrupted save
+        // never leaves a truncated configuration behind.
+        let temporary = self.path.with_extension("json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(config)?)
+            .with_context(|| format!("write configuration to {}", temporary.display()))?;
+        fs::rename(&temporary, &self.path)
+            .with_context(|| format!("replace configuration at {}", self.path.display()))
     }
 }
 
@@ -478,9 +481,31 @@ mod tests {
 
     #[test]
     fn defaults_compile_to_constant_time_lookup() {
-        let runtime = RuntimeBindings::new(&Config::default()).unwrap();
+        let runtime = RuntimeBindings::new();
+        runtime.apply(&Config::default()).unwrap();
         assert_eq!(runtime.action_for(InputKey::I), Some(Action::ArrowUp));
         assert_eq!(runtime.action_for(InputKey::J), Some(Action::ArrowLeft));
+    }
+
+    #[test]
+    fn action_codes_round_trip() {
+        for (index, action) in Action::ALL.iter().enumerate() {
+            assert_eq!(*action as usize, index);
+            assert_eq!(Action::from_code(*action as u8), Some(*action));
+        }
+        assert_eq!(Action::from_code(NO_ACTION), None);
+    }
+
+    #[test]
+    fn disabling_clears_every_lookup() {
+        let runtime = RuntimeBindings::new();
+        let config = Config {
+            enabled: false,
+            ..Config::default()
+        };
+        runtime.apply(&config).unwrap();
+        assert!(!runtime.is_enabled());
+        assert_eq!(runtime.action_for(InputKey::I), None);
     }
 
     #[test]

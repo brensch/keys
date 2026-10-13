@@ -1,6 +1,4 @@
-use crate::config::RuntimeBindings;
 use anyhow::Result;
-use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -16,8 +14,17 @@ pub use macos::KeyboardManager;
 #[cfg(target_os = "windows")]
 pub use windows::KeyboardManager;
 
-pub fn start_keyboard(runtime: Arc<RuntimeBindings>) -> Result<KeyboardManager> {
-    KeyboardManager::new(runtime)
+pub fn start_keyboard() -> Result<KeyboardManager> {
+    KeyboardManager::new()
+}
+
+/// Platforms that intercept Caps Lock purely in software need no extra work when
+/// remapping is toggled; macOS overrides this to hand Caps Lock back to the system.
+#[cfg(not(target_os = "macos"))]
+impl KeyboardManager {
+    pub fn set_enabled(&self, _enabled: bool) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -6,7 +6,6 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0"
-arc-swap = "1.7"
 directories = "6.0"
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
 env_logger = "0.11"
@@ -37,10 +36,19 @@ features = [
 ]
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.25"
+ctrlc = { version = "3.4", features = ["termination"] }
 enigo = { version = "0.6", default-features = false }
-rdev = { version = "0.5", features = ["unstable_grab"] }
+winit = { version = "0.30", default-features = false }
 
 [build-dependencies]
 embed-resource = "1.5"
 ico = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Whole-program optimization lets the hook paths inline across crate boundaries.
+# Panics keep unwinding so the macOS Caps Lock mapping is still restored on a crash.
+[profile.release]
+lto = "fat"
+codegen-units = 1

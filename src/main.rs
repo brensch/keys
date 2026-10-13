@@ -1,14 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use anyhow::Result;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 mod app;
 mod config;
 mod platform;
 
-use config::{Config, ConfigStore, RuntimeBindings};
+use config::{Config, ConfigStore, BINDINGS};
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("nocaps=info"))
@@ -27,21 +26,20 @@ fn main() -> Result<()> {
             Config::default()
         }
     };
-    let runtime = Arc::new(RuntimeBindings::new(&config)?);
-    let running = Arc::new(AtomicBool::new(true));
+    BINDINGS.apply(&config)?;
 
     // Keep the platform hook alive for the full lifetime of the UI event loop.
-    let keyboard = match platform::start_keyboard(runtime.clone()) {
-        Ok(keyboard) => Some(keyboard),
+    let keyboard = match platform::start_keyboard() {
+        Ok(keyboard) => Some(Arc::new(keyboard)),
         Err(error) => {
             log::error!("keyboard remapping is unavailable: {error:#}");
-            startup_errors.push(format!("Keyboard remapping is unavailable: {error}"));
+            startup_errors.push(format!("Keyboard remapping is unavailable: {error:#}"));
             None
         }
     };
 
     let startup_error = (!startup_errors.is_empty()).then(|| startup_errors.join("\n"));
-    let result = app::run(runtime, config, store, running, startup_error);
+    let result = app::run(keyboard.clone(), config, store, startup_error);
     drop(keyboard);
     result
 }

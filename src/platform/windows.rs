@@ -1,16 +1,14 @@
-use crate::config::{Action, InputKey, RuntimeBindings};
+use crate::config::{Action, InputKey, BINDINGS};
 use anyhow::{anyhow, Result};
 use log::info;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-static RUNTIME: OnceLock<Arc<RuntimeBindings>> = OnceLock::new();
 static HELD_TARGETS: [AtomicU16; InputKey::COUNT] = [const { AtomicU16::new(0) }; InputKey::COUNT];
 static CAPS_CAPTURED: AtomicBool = AtomicBool::new(false);
 const RELEASE_ALREADY_SENT: u16 = u16::MAX;
@@ -21,11 +19,7 @@ pub struct KeyboardManager {
 }
 
 impl KeyboardManager {
-    pub fn new(runtime: Arc<RuntimeBindings>) -> Result<Self> {
-        RUNTIME
-            .set(runtime)
-            .map_err(|_| anyhow!("keyboard manager has already been initialized"))?;
-
+    pub fn new() -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("nocaps-windows-input".to_owned())
@@ -81,47 +75,53 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         return call_next_hook(code, wparam, lparam);
     }
 
-    let event = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    // The hook only ever runs on the thread that installed it, so the atomics below are
+    // never contended: relaxed loads and stores compile to plain moves, and the hot path
+    // has no locked read-modify-write instructions.
+    let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
     if event.flags.0 & LLKHF_INJECTED.0 != 0 {
         return call_next_hook(code, wparam, lparam);
     }
-
-    let virtual_key = event.vkCode as i32;
-    let source = key_from_windows_scan(event.scanCode, event.flags.0 & LLKHF_EXTENDED.0 != 0);
     let is_down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
     let is_up = wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize;
     if !is_down && !is_up {
-        return CallNextHookEx(None, code, wparam, lparam);
+        return call_next_hook(code, wparam, lparam);
     }
 
-    if virtual_key == VK_CAPITAL.0 as i32 {
-        if is_up && CAPS_CAPTURED.swap(false, Ordering::Relaxed) {
+    if event.vkCode == u32::from(VK_CAPITAL.0) {
+        if is_up && CAPS_CAPTURED.load(Ordering::Relaxed) {
+            CAPS_CAPTURED.store(false, Ordering::Relaxed);
             release_held_targets(true);
             return LRESULT(1);
         }
-        if is_down && runtime_enabled() {
+        if is_down && BINDINGS.is_enabled() {
             force_caps_lock_off();
             CAPS_CAPTURED.store(true, Ordering::Relaxed);
             return LRESULT(1);
         }
     }
 
-    if is_up {
-        if let Some(source) = source {
-            let target = HELD_TARGETS[source.index()].swap(0, Ordering::Relaxed);
-            if target == RELEASE_ALREADY_SENT {
-                return LRESULT(1);
-            }
-            if target != 0 {
-                send_key(target, false);
-                return LRESULT(1);
-            }
+    let source = key_from_windows_scan(event.scanCode, event.flags.0 & LLKHF_EXTENDED.0 != 0);
+    if let Some(source) = source {
+        let held = &HELD_TARGETS[source.index()];
+        let target = held.load(Ordering::Relaxed);
+        if is_up && target != 0 {
+            held.store(0, Ordering::Relaxed);
+        }
+        // Caps Lock was released first, so the target is already up: swallow the rest
+        // of this physical press, including auto-repeat, so no unmatched key-up leaks.
+        if target == RELEASE_ALREADY_SENT {
+            return LRESULT(1);
+        }
+        if is_up && target != 0 {
+            send_key(target, false);
+            return LRESULT(1);
         }
     }
 
     if is_down && CAPS_CAPTURED.load(Ordering::Relaxed) {
         if let Some(source) = source {
-            if let Some(target) = configured_target(source) {
+            if let Some(target) = BINDINGS.action_for(source).map(windows_code) {
                 HELD_TARGETS[source.index()].store(target, Ordering::Relaxed);
                 send_key(target, true);
                 return LRESULT(1);
@@ -134,14 +134,6 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 
 fn call_next_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
-}
-
-fn configured_target(source: InputKey) -> Option<u16> {
-    RUNTIME.get()?.action_for(source).map(windows_code)
-}
-
-fn runtime_enabled() -> bool {
-    RUNTIME.get().is_some_and(|runtime| runtime.is_enabled())
 }
 
 fn send_key(code: u16, down: bool) {
@@ -176,13 +168,16 @@ fn force_caps_lock_off() {
 }
 
 fn release_held_targets(swallow_physical_release: bool) {
+    let released = if swallow_physical_release {
+        RELEASE_ALREADY_SENT
+    } else {
+        0
+    };
     for target in &HELD_TARGETS {
-        let held = target.swap(0, Ordering::Relaxed);
+        let held = target.load(Ordering::Relaxed);
         if held != 0 && held != RELEASE_ALREADY_SENT {
             send_key(held, false);
-            if swallow_physical_release {
-                target.store(RELEASE_ALREADY_SENT, Ordering::Relaxed);
-            }
+            target.store(released, Ordering::Relaxed);
         }
     }
 }
