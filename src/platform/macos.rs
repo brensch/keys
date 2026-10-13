@@ -28,7 +28,7 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use enigo::{Direction, Enigo, Key as EnigoKey, Keyboard, Settings};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::cell::{OnceCell, RefCell};
 use std::process::Command;
 use std::rc::Rc;
@@ -46,6 +46,10 @@ const KEYCODE_F18: CGKeyCode = 0x4F;
 const LEFT_SHIFT_FLAGS: u64 = CGEventFlags::CGEventFlagShift.bits() | 0x0000_0002;
 const LEFT_COMMAND_FLAGS: u64 = CGEventFlags::CGEventFlagCommand.bits() | 0x0000_0008;
 const LEFT_OPTION_FLAGS: u64 = CGEventFlags::CGEventFlagAlternate.bits() | 0x0000_0020;
+const MODIFIER_FLAGS: u64 = CGEventFlags::CGEventFlagShift.bits()
+    | CGEventFlags::CGEventFlagControl.bits()
+    | CGEventFlags::CGEventFlagAlternate.bits()
+    | CGEventFlags::CGEventFlagCommand.bits();
 const KEY_SPECIFIC_FLAGS: u64 =
     CGEventFlags::CGEventFlagNumericPad.bits() | CGEventFlags::CGEventFlagSecondaryFn.bits();
 
@@ -225,6 +229,9 @@ impl TapState {
         event_type: CGEventType,
         event: &CGEvent,
     ) -> CallbackResult {
+        if log::log_enabled!(log::Level::Debug) {
+            log_event("seen", event_type, event);
+        }
         let down = match event_type {
             CGEventType::KeyDown => true,
             CGEventType::KeyUp => false,
@@ -394,11 +401,36 @@ impl TapState {
         repeat: bool,
         physical_flags: u64,
     ) {
-        let flags = (physical_flags & !KEY_SPECIFIC_FLAGS)
-            | self.layer_flags
-            | extra_flags
-            | key_specific_flags(code);
+        let base = (physical_flags & !KEY_SPECIFIC_FLAGS) | self.layer_flags;
+        // A real keyboard announces a modifier with its own press and release around the
+        // key it modifies, and some apps track modifiers from those announcements rather
+        // than from the key event's flags. Send the same sequence, unless that modifier
+        // is already physically held.
+        let announced = (base & extra_flags & MODIFIER_FLAGS == 0)
+            .then(|| modifier_keycode(extra_flags))
+            .flatten();
+        if let (Some(modifier), true, false) = (announced, down, repeat) {
+            self.post_key(
+                proxy,
+                modifier,
+                true,
+                false,
+                CGEventType::FlagsChanged,
+                base | extra_flags,
+            );
+        }
+        let flags = base | extra_flags | key_specific_flags(code);
         self.post_key(proxy, code, down, repeat, CGEventType::KeyDown, flags);
+        if let (Some(modifier), false) = (announced, down) {
+            self.post_key(
+                proxy,
+                modifier,
+                false,
+                false,
+                CGEventType::FlagsChanged,
+                base,
+            );
+        }
     }
 
     fn post_key(
@@ -420,7 +452,45 @@ impl TapState {
         event.set_flags(CGEventFlags::from_bits_retain(flags));
         event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, i64::from(repeat));
         event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SYNTHETIC_TAG);
+        if log::log_enabled!(log::Level::Debug) {
+            log_event("sent", event.get_type(), &event);
+        }
         event.post_from_tap(proxy);
+    }
+}
+
+/// Debug trace for diagnosing how apps see keys. Only navigation, editing and
+/// modifier keys are logged, never characters, so the log cannot capture typed text.
+fn log_event(direction: &str, event_type: CGEventType, event: &CGEvent) {
+    let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as CGKeyCode;
+    let kind = match event_type {
+        CGEventType::KeyDown => "down",
+        CGEventType::KeyUp => "up",
+        CGEventType::FlagsChanged => "flags",
+        _ => return,
+    };
+    let loggable = matches!(
+        code,
+        KEY_BACKSPACE | KEY_FORWARD_DELETE | KEY_HOME | KEY_END | KEY_PAGE_UP | KEY_PAGE_DOWN
+    ) || (KEY_LEFT..=KEY_UP).contains(&code)
+        || (0x36..=0x3F).contains(&code)
+        || code == KEYCODE_F18;
+    if loggable {
+        debug!(
+            "{direction} {kind:<5} key={code:#04x} flags={:#010x} repeat={} source={}",
+            event.get_flags().bits(),
+            event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT),
+            event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
+        );
+    }
+}
+
+/// The modifier key whose press announces `flags`, if the translation adds one.
+fn modifier_keycode(flags: u64) -> Option<CGKeyCode> {
+    match flags {
+        LEFT_OPTION_FLAGS => Some(0x3A),
+        LEFT_COMMAND_FLAGS => Some(0x37),
+        _ => None,
     }
 }
 
@@ -757,6 +827,13 @@ mod tests {
         );
         assert_eq!(mac_keystroke(KEY_END, true), (KEY_DOWN, LEFT_COMMAND_FLAGS));
         assert_eq!(mac_keystroke(KEY_RETURN, true), (KEY_RETURN, 0));
+    }
+
+    #[test]
+    fn translated_modifiers_are_announced_with_their_own_key() {
+        assert_eq!(modifier_keycode(LEFT_OPTION_FLAGS), Some(0x3A));
+        assert_eq!(modifier_keycode(LEFT_COMMAND_FLAGS), Some(0x37));
+        assert_eq!(modifier_keycode(0), None);
     }
 
     #[test]

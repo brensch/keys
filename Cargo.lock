@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "nocaps"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "anyhow",
  "core-foundation 0.10.1",
