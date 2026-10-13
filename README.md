@@ -8,9 +8,10 @@
 
 [![Build](https://github.com/brensch/keys/actions/workflows/build.yml/badge.svg)](https://github.com/brensch/keys/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/brensch/keys?color=E8453C)](https://github.com/brensch/keys/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-1B1B1F)](LICENSE)
 
 [**Windows**](https://github.com/brensch/keys/releases/latest/download/nocaps-windows.exe) ·
-[**macOS** (Apple Silicon)](https://github.com/brensch/keys/releases/latest/download/nocaps-macos) ·
+**macOS** [Apple Silicon](https://github.com/brensch/keys/releases/latest/download/nocaps-macos-arm64) / [Intel](https://github.com/brensch/keys/releases/latest/download/nocaps-macos-intel) ·
 [**Linux**](https://github.com/brensch/keys/releases/latest/download/nocaps-linux)
 
 <img src="docs/screenshot.png" width="560" alt="nocaps configuration window">
@@ -36,7 +37,7 @@ nocaps runs in the system tray. Choose **Configure** to rebind: click a key, pre
 | | |
 | --- | --- |
 | **Windows** | Run `nocaps-windows.exe`. To start at sign-in, put it in `shell:startup`. |
-| **macOS** | `chmod +x nocaps-macos && xattr -d com.apple.quarantine nocaps-macos`, run it, then allow it under **System Settings → Privacy & Security → Accessibility**. |
+| **macOS** | `chmod +x nocaps-macos-* && xattr -d com.apple.quarantine nocaps-macos-*`, run it, then allow it under **System Settings → Privacy & Security → Accessibility**. |
 | **Linux** | Needs read access to `/dev/input` and write access to `/dev/uinput`: `sudo usermod -aG input "$USER"`, then sign out and back in. |
 
 ## Fast by design
@@ -81,6 +82,6 @@ cargo build --release
 Linux also needs `libgtk-3-dev libayatana-appindicator3-dev`.
 </details>
 
-## Credits
+## License
 
-Icon cap from [Twemoji](https://github.com/jdecked/twemoji) (CC-BY 4.0). Interface font [Inter](https://github.com/rsms/inter) (SIL OFL 1.1).
+[MIT](LICENSE). Icon cap from [Twemoji](https://github.com/jdecked/twemoji) (CC-BY 4.0); interface font [Inter](https://github.com/rsms/inter) (SIL OFL 1.1).

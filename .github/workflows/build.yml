@@ -12,20 +12,32 @@ env:
 
 jobs:
   build:
-    name: Build on ${{ matrix.name }}
+    name: Build ${{ matrix.asset }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - name: windows
-            os: windows-latest
-            binary: target/release/nocaps.exe
-          - name: macos
-            os: macos-latest
-            binary: target/release/nocaps
-          - name: linux
-            os: ubuntu-latest
-            binary: target/release/nocaps
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: nocaps-windows.exe
+            binary: nocaps.exe
+            test: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: nocaps-macos-arm64
+            binary: nocaps
+            test: true
+          # GitHub no longer offers Intel macOS runners, so cross-compile from Apple Silicon.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: nocaps-macos-intel
+            binary: nocaps
+            test: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: nocaps-linux
+            binary: nocaps
+            test: true
 
     steps:
       - uses: actions/checkout@v4
@@ -36,48 +48,58 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Test
-        run: cargo test --all-targets
+        if: matrix.test
+        run: cargo test --all-targets --target ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --verbose --release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nocaps-${{ matrix.name }}
-          path: ${{ matrix.binary }}
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
 
   release:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Generate release notes
-        run: git tag -l --format='%(contents)' "${{ github.ref_name }}" > release_notes.txt
+        run: |
+          git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+          git tag -l --format='%(contents)' "${{ github.ref_name }}" > release_notes.txt
 
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: release
+          merge-multiple: true
 
-      - name: Rename release files
-        run: |
-          mkdir release
-          mv artifacts/nocaps-windows/nocaps.exe release/nocaps-windows.exe
-          mv artifacts/nocaps-macos/nocaps release/nocaps-macos
-          mv artifacts/nocaps-linux/nocaps release/nocaps-linux
-          chmod +x release/nocaps-macos release/nocaps-linux
+      - name: Mark binaries executable
+        run: chmod +x release/nocaps-macos-* release/nocaps-linux
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           body_path: release_notes.txt
-          files: |
-            release/nocaps-windows.exe
-            release/nocaps-macos
-            release/nocaps-linux
+          files: release/*
