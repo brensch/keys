@@ -1,98 +1,86 @@
+<div align="center">
+
+<img src="assets/nocaps-icon.png" width="112" alt="nocaps icon">
+
 # nocaps
 
-`nocaps` turns Caps Lock into a configurable keyboard layer on Windows, macOS, and Linux. Hold Caps Lock and press a bound physical key to invoke an action such as an arrow key, Control, volume control, or media playback.
+**Turn Caps Lock into a keyboard layer.** Arrows, editing, modifiers and media on the home row, on Windows, macOS and Linux.
 
-Right-click the struck-through graduation-cap icon and choose **Configure**. The window shows every available action in the same interface on each OS. Click an action's binding, press the physical key that should trigger it, and the change is compiled, applied, and saved immediately. Assigning an already-used key moves that key to the new action.
+[![Build](https://github.com/brensch/keys/actions/workflows/build.yml/badge.svg)](https://github.com/brensch/keys/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/brensch/keys?color=E8453C)](https://github.com/brensch/keys/releases/latest)
 
-Remapping defaults to enabled. The tray menu shows **Enabled** or **Disabled** and toggles the state when clicked. The window uses the same state with a **No Caps** or **Caps** button.
+[**Windows**](https://github.com/brensch/keys/releases/latest/download/nocaps-windows.exe) ·
+[**macOS** (Apple Silicon)](https://github.com/brensch/keys/releases/latest/download/nocaps-macos) ·
+[**Linux**](https://github.com/brensch/keys/releases/latest/download/nocaps-linux)
 
-The configuration window is implemented in `src/app.rs`. `src/config.rs` contains the JSON model, validation, and compiled runtime lookup; it does not create a window.
+<img src="docs/screenshot.png" width="560" alt="nocaps configuration window">
 
-## Configuration file
+</div>
 
-Configuration is loaded at startup and saved as formatted JSON:
+## How it works
+
+Hold **Caps Lock** and press a bound key. Caps Lock itself never toggles while nocaps is enabled.
+
+| Hold Caps Lock + | Does | | Hold Caps Lock + | Does |
+| :-: | --- | --- | :-: | --- |
+| <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> | ↑ ← ↓ → | | <kbd>A</kbd> / <kbd>S</kbd> | Control / Shift |
+| <kbd>H</kbd> / <kbd>;</kbd> | Home / End | | <kbd>Q</kbd> / <kbd>W</kbd> / <kbd>Tab</kbd> | Volume down / up / mute |
+| <kbd>U</kbd> / <kbd>O</kbd> | Backspace / Delete | | <kbd>E</kbd> / <kbd>R</kbd> / <kbd>T</kbd> | Previous / play-pause / next |
+
+Combine freely: Caps Lock + <kbd>S</kbd> + <kbd>J</kbd> is Shift+←, and Caps Lock + <kbd>A</kbd> + <kbd>C</kbd> is Ctrl+C.
+
+nocaps runs in the system tray. Choose **Configure** to rebind: click a key, press the new one, and it is applied and saved instantly.
+
+## Install
+
+| | |
+| --- | --- |
+| **Windows** | Run `nocaps-windows.exe`. To start at sign-in, put it in `shell:startup`. |
+| **macOS** | `chmod +x nocaps-macos && xattr -d com.apple.quarantine nocaps-macos`, run it, then allow it under **System Settings → Privacy & Security → Accessibility**. |
+| **Linux** | Needs read access to `/dev/input` and write access to `/dev/uinput`: `sudo usermod -aG input "$USER"`, then sign out and back in. |
+
+## Fast by design
+
+Every platform uses its lowest-level input interface short of a kernel driver: a `WH_KEYBOARD_LL` hook on Windows, a Core Graphics event tap on macOS, and evdev/uinput on Linux. Bindings live in a static table, so each key event costs one memory load: no locks, allocation or lookups. The window does no work while it sits in the tray.
+
+## Details
+
+<details>
+<summary>Configuration file</summary>
+
+Changes made in the window are saved as JSON:
 
 - Windows: `%APPDATA%\nocaps\config.json`
 - macOS: `~/Library/Application Support/nocaps/config.json`
 - Linux: `~/.config/nocaps/config.json`
 
-The repository's `config/default.json` is compiled into the executable. It is not a runtime sidecar file. If the user configuration does not exist, `nocaps` loads the embedded original bindings, writes an editable user copy, and uses them immediately. **Restore defaults** uses the same embedded data.
-
-Example:
-
 ```json
 {
   "version": 1,
   "enabled": true,
-  "bindings": {
-    "left_control": "a",
-    "left_shift": "s",
-    "arrow_up": "i",
-    "arrow_down": "k",
-    "volume_up": "w",
-    "volume_down": "q",
-    "volume_mute": "tab"
-  }
+  "bindings": { "arrow_up": "i", "left_control": "a", "volume_mute": "tab" }
 }
 ```
 
-Each action can have one key and each key can have one action. Unknown versions and duplicate key assignments are rejected with an explicit error.
+Each action takes one key and each key triggers one action. Defaults are compiled in from [`config/default.json`](config/default.json).
+</details>
 
-## Performance model
+<details>
+<summary>macOS and Caps Lock</summary>
 
-JSON and validation run only at startup or when a binding changes. Valid bindings are written into a static table with one atomic byte per physical key, so a hook lookup is a single relaxed load: no locks, reference counts, pointer chasing, hashing, searching, or allocation. Platform modules only translate native input codes to the shared physical-key enum and shared actions back to native output codes.
+macOS latches Caps Lock in its HID driver, below any app, so nocaps uses `hidutil` to remap Caps Lock to F18 while enabled. Disabling or quitting restores your previous mapping. If nocaps is force-killed, Caps Lock acts as F18 until nocaps is next run or the Mac restarts.
+</details>
 
-Each platform uses the lowest-level interface available without installing a kernel driver:
-
-- **Windows:** a raw `WH_KEYBOARD_LL` hook. The hook runs on one thread, so its state uses relaxed atomics that compile to plain moves, with no locked instructions on the hot path.
-- **macOS:** a `CGEventTap` called directly through Core Graphics. While no layer key or layered key is held, a keystroke costs one field read before the event is handed back.
-- **Linux:** evdev raw devices and uinput. Each keyboard worker performs one blocking `read` and at most one `write` per batch of kernel events, forwarding the kernel's own frame markers, and writes through its own uinput handle so workers share no lock.
-
-Remapping input processing never runs on the renderer thread. Windows installs the low-level hook on a dedicated `THREAD_PRIORITY_HIGHEST` Win32 message-loop thread. Linux keyboard-device workers and the macOS capture worker request realtime/high scheduling priority and continue at normal priority with a warning if the OS denies that request. Linux realtime priority generally requires `CAP_SYS_NICE` or an equivalent service limit.
-
-The configuration window is event-driven and does not poll. The egui loop repaints only in response to window input or a tray activation: tray menu clicks are delivered through a handler that wakes the UI thread, so while the window sits hidden in the tray the process stays idle instead of repainting on a timer. Linux is the one exception — its AppIndicator menu only emits events while the GTK main loop is iterated, so the window keeps a low-frequency tick to drive that pump.
-
-## Platform setup
-
-### Windows
-
-No additional runtime setup is required. To launch at sign-in, place `nocaps.exe` in the Startup folder (`Win+R`, then `shell:startup`).
-
-### macOS
-
-Grant `nocaps` access in **System Settings → Privacy & Security → Accessibility**. macOS shows the prompt on first launch; restart `nocaps` after granting it.
-
-macOS latches Caps Lock in the HID driver, below any event tap, so the key cannot be suppressed in software alone. While remapping is enabled, `nocaps` uses `hidutil` to remap Caps Lock to F18 and treats F18 as the layer key. Disabling remapping or quitting restores your previous `hidutil` key mapping, including on Ctrl+C or `SIGTERM`. If the process is force-killed, Caps Lock stays mapped to F18 until the next launch or reboot. `nocaps` runs without a Dock icon.
-
-### Linux
-
-The Linux backend uses evdev and uinput, independently of X11 or Wayland. The user needs read access to keyboard devices under `/dev/input` and write access to `/dev/uinput`. Be aware that membership in the `input` group grants access to raw keyboard input.
-
-Ubuntu/Debian build dependencies:
+<details>
+<summary>Building from source</summary>
 
 ```bash
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev
-```
-
-Typical device setup:
-
-```bash
-sudo modprobe uinput
-sudo usermod -aG input "$USER"
-```
-
-Log out and back in after changing group membership. A newly connected keyboard currently requires restarting `nocaps`.
-
-## Building
-
-```bash
-cargo test
 cargo build --release
 ```
 
-The executable is `target/release/nocaps` (`nocaps.exe` on Windows). CI builds and tests Windows, macOS, and Linux.
+Linux also needs `libgtk-3-dev libayatana-appindicator3-dev`.
+</details>
 
 ## Credits
 
-- Icon cap: [Twemoji](https://github.com/jdecked/twemoji) U+1F9E2, © Twitter/X and contributors, [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Source: `assets/nocaps-icon.svg`.
-- Font: [Inter](https://github.com/rsms/inter), SIL Open Font License 1.1 (`assets/Inter-LICENSE.txt`).
+Icon cap from [Twemoji](https://github.com/jdecked/twemoji) (CC-BY 4.0). Interface font [Inter](https://github.com/rsms/inter) (SIL OFL 1.1).
