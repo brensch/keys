@@ -38,7 +38,7 @@ nocaps runs in the system tray. Choose **Configure** to rebind: click a key, pre
 | --- | --- |
 | **Windows** | Run `nocaps-windows.exe`. To start at sign-in, put it in `shell:startup`. |
 | **macOS** | `chmod +x nocaps-macos-* && xattr -d com.apple.quarantine nocaps-macos-*`, run it, then allow it under **System Settings → Privacy & Security → Accessibility**. |
-| **Linux** | Needs read access to `/dev/input` and write access to `/dev/uinput`: `sudo usermod -aG input "$USER"`, then sign out and back in. |
+| **Linux** | Needs read access to `/dev/input` and write access to `/dev/uinput`: `sudo usermod -aG input "$USER"`, then sign out and back in. Keyboards plugged in later (or reconnected through a dock) are picked up automatically. nocaps adds itself to the app grid; launching it again opens the running copy's window. |
 
 ## Fast by design
 

@@ -40,8 +40,16 @@ fn elevate_input_thread() {
         ThreadPriority::Max,
         realtime,
     ) {
+        // Every keyboard worker asks, so only the first refusal is worth a warning.
         #[cfg(target_os = "linux")]
-        log::warn!("realtime input priority denied ({error}); grant CAP_SYS_NICE to enable it");
+        {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log::warn!(
+                    "realtime input priority denied ({error}); grant CAP_SYS_NICE to enable it"
+                )
+            });
+        }
 
         #[cfg(target_os = "macos")]
         if let Err(fallback_error) = ThreadPriority::Max.set_for_current() {

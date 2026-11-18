@@ -2,43 +2,86 @@ use crate::config::{Action, InputKey, BINDINGS};
 use anyhow::{anyhow, Context, Result};
 use evdev::raw_stream::RawDevice;
 use evdev::uinput::VirtualDevice;
-use evdev::{AttributeSet, EventType, InputEvent, KeyCode, SynchronizationCode};
-use log::{error, info};
+use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode, SynchronizationCode};
+use log::{debug, error, info, warn};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
-use std::os::fd::AsFd;
+use std::io::{self, Write};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 /// Caps Lock held on any keyboard activates the layer on every keyboard.
 static LAYER_HOLDERS: AtomicUsize = AtomicUsize::new(0);
 
+const VIRTUAL_NAME: &str = "nocaps virtual keyboard";
+const INPUT_DIR: &str = "/dev/input";
+/// inotify wakes the watcher the moment a device node appears or its permissions
+/// change; the periodic rescan only backstops races such as a node number being
+/// reused before the previous owner's worker noticed the unplug.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// Key codes are below KEY_MAX (0x2ff), so a 768-bit set covers every key.
+const KEY_SLOTS: usize = 0x300;
+
+/// Identifies one incarnation of a device node: unplugging and replugging a keyboard
+/// can hand out the same `/dev/input/eventN` path, but never the same inode and ctime.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct NodeId {
+    rdev: u64,
+    ino: u64,
+    ctime: (i64, i64),
+}
+
+impl NodeId {
+    fn of(path: &Path) -> io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            rdev: meta.rdev(),
+            ino: meta.ino(),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+/// Shared between the hotplug watcher and the per-keyboard workers.
+struct Hub {
+    /// Kept alive for as long as any worker may still write through a duplicate of
+    /// its handle; dropping it destroys the virtual keyboard.
+    virtual_keyboard: VirtualDevice,
+    /// Nodes a worker currently owns.
+    grabbed: Mutex<HashMap<PathBuf, NodeId>>,
+}
+
+impl Hub {
+    fn output(&self) -> Result<File> {
+        // Each worker writes through its own handle to the virtual keyboard: uinput
+        // accepts whole events per write, so the workers never need to share a lock.
+        Ok(File::from(
+            self.virtual_keyboard
+                .as_fd()
+                .try_clone_to_owned()
+                .context("duplicate the virtual keyboard handle")?,
+        ))
+    }
+}
+
 pub struct KeyboardManager {
-    _virtual_keyboard: VirtualDevice,
-    _threads: Vec<JoinHandle<()>>,
+    _hub: Arc<Hub>,
 }
 
 impl KeyboardManager {
     pub fn new() -> Result<Self> {
-        // Raw devices skip evdev's per-event key-state bookkeeping, which nocaps never reads.
-        let mut devices: Vec<RawDevice> = evdev::raw_stream::enumerate()
-            .map(|(_, device)| device)
-            .filter(is_keyboard)
-            .collect();
-
-        if devices.is_empty() {
-            return Err(anyhow!(
-                "no readable keyboards found; grant access to /dev/input and /dev/uinput"
-            ));
-        }
-
+        // The virtual keyboard advertises every keyboard key up front, because uinput
+        // capabilities are fixed at creation and keyboards plugged in later may have
+        // keys the first ones lacked. Mouse, joystick and touch buttons (0x100-0x15f,
+        // 0x2c0-0x2ff) are left out so libinput still classifies it as a keyboard.
         let mut supported = AttributeSet::<KeyCode>::new();
-        for device in &devices {
-            if let Some(keys) = device.supported_keys() {
-                for key in keys {
-                    supported.insert(key);
-                }
-            }
+        for code in (1..0x100).chain(0x160..0x2c0) {
+            supported.insert(KeyCode::new(code));
         }
         for action in Action::ALL {
             supported.insert(linux_action_code(*action));
@@ -46,46 +89,246 @@ impl KeyboardManager {
 
         let virtual_keyboard = VirtualDevice::builder()
             .context("open /dev/uinput")?
-            .name("nocaps virtual keyboard")
+            .name(VIRTUAL_NAME)
+            .input_id(InputId::new(BusType::BUS_VIRTUAL, 0x6e63, 0x0001, 1))
             .with_keys(&supported)
             .context("configure virtual keyboard")?
             .build()
             .context("create virtual keyboard")?;
 
-        for device in &mut devices {
-            device
-                .grab()
-                .with_context(|| format!("grab {}", device.name().unwrap_or("keyboard")))?;
+        let hub = Arc::new(Hub {
+            virtual_keyboard,
+            grabbed: Mutex::new(HashMap::new()),
+        });
+
+        // The first scan runs synchronously so a machine where nocaps can read no
+        // input devices at all is reported at startup instead of failing silently.
+        let mut watcher = Watcher::new(Arc::clone(&hub));
+        let scan = watcher.scan();
+        if scan.grabbed == 0 && scan.denied > 0 {
+            return Err(anyhow!(
+                "no readable keyboards found; grant access to /dev/input and /dev/uinput"
+            ));
+        }
+        if scan.grabbed == 0 {
+            warn!("no keyboards found yet; waiting for one to be plugged in");
         }
 
-        let mut threads = Vec::with_capacity(devices.len());
-        for device in devices {
-            // Each worker writes through its own handle to the virtual keyboard: uinput
-            // accepts whole events per write, so the workers never need to share a lock.
-            let output = File::from(
-                virtual_keyboard
-                    .as_fd()
-                    .try_clone_to_owned()
-                    .context("duplicate the virtual keyboard handle")?,
-            );
-            let name = device.name().unwrap_or("keyboard").to_owned();
-            threads.push(
-                thread::Builder::new()
-                    .name(format!("nocaps-{name}"))
-                    .spawn(move || run_device(device, output, &name))
-                    .context("start Linux keyboard worker")?,
-            );
-        }
+        thread::Builder::new()
+            .name("nocaps-hotplug".to_owned())
+            .spawn(move || watcher.run())
+            .context("start the Linux keyboard hotplug watcher")?;
 
-        info!("remapping {} Linux keyboard device(s)", threads.len());
-        Ok(Self {
-            _virtual_keyboard: virtual_keyboard,
-            _threads: threads,
-        })
+        Ok(Self { _hub: hub })
+    }
+}
+
+#[derive(Default)]
+struct ScanResult {
+    grabbed: usize,
+    denied: usize,
+}
+
+/// Finds keyboards as they appear and hands each one to its own worker thread.
+struct Watcher {
+    hub: Arc<Hub>,
+    /// Nodes already examined and skipped (not a keyboard, unreadable, or grabbed by
+    /// someone else). A node is examined again once its identity changes, e.g. when
+    /// udev grants access after creating it.
+    skipped: HashMap<PathBuf, NodeId>,
+    /// Keyboards another program has grabbed. They are retried on every scan so
+    /// nocaps takes over once that program exits, but only warned about once.
+    busy: HashMap<PathBuf, NodeId>,
+    inotify: Option<OwnedFd>,
+}
+
+enum Grab {
+    Grabbed,
+    NotKeyboard,
+    Busy,
+}
+
+impl Watcher {
+    fn new(hub: Arc<Hub>) -> Self {
+        let inotify = watch_input_dir()
+            .map_err(|error| {
+                warn!("cannot watch {INPUT_DIR} for new keyboards ({error}); polling instead")
+            })
+            .ok();
+        Self {
+            hub,
+            skipped: HashMap::new(),
+            busy: HashMap::new(),
+            inotify,
+        }
+    }
+
+    fn run(mut self) {
+        loop {
+            self.wait();
+            self.scan();
+        }
+    }
+
+    /// Blocks until /dev/input changes or the rescan interval passes.
+    fn wait(&self) {
+        let Some(fd) = &self.inotify else {
+            thread::sleep(RESCAN_INTERVAL);
+            return;
+        };
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` points at one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut poll, 1, RESCAN_INTERVAL.as_millis() as i32) };
+        if ready > 0 {
+            // Drain the queued events; their contents don't matter because every
+            // wake-up rescans the whole directory.
+            let mut buffer = [0u8; 4096];
+            // SAFETY: the buffer is valid for writes of its full length.
+            while unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) }
+                > 0
+            {}
+            // Let udev finish tagging and granting access before opening the node.
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn scan(&mut self) -> ScanResult {
+        let mut result = ScanResult::default();
+        let entries = match std::fs::read_dir(INPUT_DIR) {
+            Ok(entries) => entries,
+            Err(error) => {
+                error!("cannot list {INPUT_DIR}: {error}");
+                return result;
+            }
+        };
+        let mut present = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_event_node = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("event"));
+            if !is_event_node {
+                continue;
+            }
+            let Ok(id) = NodeId::of(&path) else {
+                continue;
+            };
+            present.push(path.clone());
+            if self.skipped.get(&path) == Some(&id) || self.is_grabbed(&path, id) {
+                continue;
+            }
+            match self.try_grab(&path, id) {
+                Ok(Grab::Grabbed) => {
+                    self.busy.remove(&path);
+                    result.grabbed += 1;
+                }
+                Ok(Grab::NotKeyboard) => {
+                    self.skipped.insert(path, id);
+                }
+                Ok(Grab::Busy) => {
+                    if self.busy.insert(path.clone(), id) != Some(id) {
+                        warn!(
+                            "{} is grabbed by another program; will take over when it lets go",
+                            path.display()
+                        );
+                    }
+                }
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        result.denied += 1;
+                    }
+                    debug!("skipping {}: {error}", path.display());
+                    self.skipped.insert(path, id);
+                }
+            }
+        }
+        self.skipped.retain(|path, _| present.contains(path));
+        self.busy.retain(|path, _| present.contains(path));
+        result
+    }
+
+    fn is_grabbed(&self, path: &Path, id: NodeId) -> bool {
+        self.hub
+            .grabbed
+            .lock()
+            .map(|grabbed| grabbed.get(path) == Some(&id))
+            .unwrap_or(false)
+    }
+
+    fn try_grab(&self, path: &Path, id: NodeId) -> io::Result<Grab> {
+        let mut device = RawDevice::open(path)?;
+        if !is_keyboard(&device) {
+            return Ok(Grab::NotKeyboard);
+        }
+        let name = device.name().unwrap_or("keyboard").to_owned();
+        if let Err(error) = device.grab() {
+            if error.raw_os_error() == Some(libc::EBUSY) {
+                // Another remapper (or an older nocaps) already owns this keyboard.
+                return Ok(Grab::Busy);
+            }
+            return Err(error);
+        }
+        let output = self.hub.output().map_err(io::Error::other)?;
+
+        if let Ok(mut grabbed) = self.hub.grabbed.lock() {
+            grabbed.insert(path.to_owned(), id);
+        }
+        let hub = Arc::clone(&self.hub);
+        let worker_path = path.to_owned();
+        let spawned = thread::Builder::new()
+            .name(format!("nocaps-{}", path.display()))
+            .spawn(move || {
+                run_device(device, output, &name);
+                // Only forget the node if it still refers to this device: a replugged
+                // keyboard may already own the same path under a new worker.
+                if let Ok(mut grabbed) = hub.grabbed.lock() {
+                    if grabbed.get(&worker_path) == Some(&id) {
+                        grabbed.remove(&worker_path);
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            if let Ok(mut grabbed) = self.hub.grabbed.lock() {
+                grabbed.remove(path);
+            }
+            return Err(error);
+        }
+        info!("remapping {}", path.display());
+        Ok(Grab::Grabbed)
+    }
+}
+
+fn watch_input_dir() -> io::Result<OwnedFd> {
+    // SAFETY: plain syscalls; the returned descriptor is checked before being owned.
+    unsafe {
+        let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = OwnedFd::from_raw_fd(fd);
+        let dir = std::ffi::CString::new(INPUT_DIR).expect("path has no NUL");
+        if libc::inotify_add_watch(
+            fd.as_raw_fd(),
+            dir.as_ptr(),
+            libc::IN_CREATE | libc::IN_ATTRIB,
+        ) < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
     }
 }
 
 fn is_keyboard(device: &RawDevice) -> bool {
+    // Never grab our own output, or keystrokes would loop back through nocaps.
+    if device.name() == Some(VIRTUAL_NAME) {
+        return false;
+    }
     device.supported_keys().is_some_and(|keys| {
         keys.contains(KeyCode::KEY_CAPSLOCK)
             && keys.contains(KeyCode::KEY_A)
@@ -94,11 +337,42 @@ fn is_keyboard(device: &RawDevice) -> bool {
     })
 }
 
+/// Keys this worker currently holds down on the virtual keyboard, so they can all be
+/// released if the physical keyboard vanishes mid-press (otherwise a Shift held while
+/// unplugging a dock stays stuck down).
+struct HeldKeys([u64; KEY_SLOTS / 64]);
+
+impl HeldKeys {
+    fn new() -> Self {
+        Self([0; KEY_SLOTS / 64])
+    }
+
+    fn record(&mut self, code: u16, value: i32) {
+        let code = code as usize;
+        if code >= KEY_SLOTS {
+            return;
+        }
+        let (word, bit) = (code / 64, 1u64 << (code % 64));
+        match value {
+            0 => self.0[word] &= !bit,
+            1 => self.0[word] |= bit,
+            _ => {}
+        }
+    }
+
+    fn codes(&self) -> impl Iterator<Item = u16> + '_ {
+        (0..KEY_SLOTS)
+            .filter(|code| self.0[code / 64] & (1 << (code % 64)) != 0)
+            .map(|code| code as u16)
+    }
+}
+
 /// One blocking `read` per batch of kernel events and one `write` per batch of output:
 /// the kernel's own SYN_REPORT frame markers are forwarded instead of adding new ones.
 fn run_device(mut device: RawDevice, mut output: File, name: &str) {
     super::elevate_input_thread();
     let mut held_targets = [None; InputKey::COUNT];
+    let mut held = HeldKeys::new();
     let mut captured_caps = false;
     let mut translated = Vec::with_capacity(64);
 
@@ -108,8 +382,12 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
         let events = match device.fetch_events() {
             Ok(events) => events,
             Err(error) => {
-                error!("stopped reading {name}: {error}");
-                cleanup_state(captured_caps, &held_targets, &mut output);
+                if error.raw_os_error() == Some(libc::ENODEV) {
+                    info!("{name} disconnected");
+                } else {
+                    error!("stopped reading {name}: {error}");
+                }
+                cleanup_state(captured_caps, &held, &mut output);
                 return;
             }
         };
@@ -164,6 +442,7 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
             };
 
             has_keys = true;
+            held.record(target.code(), value);
             translated.push(InputEvent::new(EventType::KEY.0, target.code(), value));
         }
 
@@ -171,25 +450,20 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
         if has_keys {
             if let Err(error) = output.write_all(as_bytes(&translated)) {
                 error!("stopped writing events for {name}: {error}");
-                cleanup_state(captured_caps, &held_targets, &mut output);
+                cleanup_state(captured_caps, &held, &mut output);
                 return;
             }
         }
     }
 }
 
-fn cleanup_state(
-    captured_caps: bool,
-    held_targets: &[Option<KeyCode>; InputKey::COUNT],
-    output: &mut File,
-) {
+fn cleanup_state(captured_caps: bool, held: &HeldKeys, output: &mut File) {
     if captured_caps {
         LAYER_HOLDERS.fetch_sub(1, Ordering::Relaxed);
     }
-    let mut releases: Vec<InputEvent> = held_targets
-        .iter()
-        .flatten()
-        .map(|key| InputEvent::new(EventType::KEY.0, key.code(), 0))
+    let mut releases: Vec<InputEvent> = held
+        .codes()
+        .map(|code| InputEvent::new(EventType::KEY.0, code, 0))
         .collect();
     if !releases.is_empty() {
         releases.push(InputEvent::new(

@@ -22,19 +22,66 @@ const CORAL: egui::Color32 = egui::Color32::from_rgb(232, 69, 60);
 const CORAL_SOFT: egui::Color32 = egui::Color32::from_rgb(251, 227, 223);
 const BOLD_FONT: &str = "inter-bold";
 
+/// Starts the tray utility. On Linux the settings window only exists while it is
+/// open: Wayland cannot hide a window, and a hidden-but-alive window would still
+/// sit in the dock. Elsewhere the window lives for the whole session and is hidden
+/// while nocaps sits in the tray.
 pub fn run(
     keyboard: Option<Arc<KeyboardManager>>,
     config: Config,
     store: ConfigStore,
     startup_error: Option<String>,
+    inbox: Arc<Inbox>,
 ) -> Result<()> {
+    let mut core = Core::new(keyboard, config, store, startup_error, inbox);
+    run_platform(&mut core)
+}
+
+#[cfg(target_os = "linux")]
+fn run_platform(core: &mut Core) -> Result<()> {
+    if let Err(error) = install_desktop_entry() {
+        log::warn!("could not install the nocaps desktop entry: {error:#}");
+    }
+
+    // Problems at startup need the user's attention, so open the window at once.
+    let mut show = core.runtime_error.is_some();
+    loop {
+        if std::mem::take(&mut show) {
+            open_window(core, true)?;
+            // Without a tray there is no way back to the window, so closing it quits.
+            if core.quitting || core.tray.is_none() {
+                return Ok(());
+            }
+        }
+        // Sleep in GTK until the tray menu (or a second launch of nocaps) wakes us.
+        gtk::main_iteration();
+        for command in core.inbox.take() {
+            match command {
+                Command::ToggleEnabled => core.toggle_enabled(),
+                Command::Configure => show = true,
+                Command::Quit => return Ok(()),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_platform(core: &mut Core) -> Result<()> {
+    // The window starts in the tray unless something needs the user's attention.
+    let show_on_start = core.runtime_error.is_some() || core.tray.is_none();
+    open_window(core, show_on_start)
+}
+
+fn open_window(core: &mut Core, visible: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("nocaps")
+            // Matches nocaps.desktop, so docks and task switchers show the nocaps icon.
+            .with_app_id("nocaps")
             .with_inner_size([560.0, 580.0])
             .with_min_inner_size([540.0, 520.0])
             .with_resizable(true)
-            .with_visible(false)
+            .with_visible(visible)
             .with_icon(window_icon()),
         event_loop_builder: event_loop_builder(),
         ..Default::default()
@@ -46,10 +93,8 @@ pub fn run(
         Box::new(move |creation_context| {
             configure_style(&creation_context.egui_ctx);
             Ok(Box::new(NocapsApp::new(
-                keyboard,
-                config,
-                store,
-                startup_error,
+                core,
+                visible,
                 &creation_context.egui_ctx,
             )))
         }),
@@ -57,15 +102,60 @@ pub fn run(
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+/// Requests that reach the app from outside the settings window: the tray menu, and
+/// on Linux a second launch of nocaps asking the running one to show itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    ToggleEnabled,
+    Configure,
+    Quit,
+}
+
+/// Tray activations arrive on muda's event handler, which may run on a native
+/// callback rather than the egui frame, and single-instance requests arrive on their
+/// own thread. Both park commands here and wake whichever loop is idle: the open
+/// window's egui loop, or on Linux the GTK loop that runs while the window is closed.
+#[derive(Default)]
+pub struct Inbox {
+    commands: Mutex<Vec<Command>>,
+    window: Mutex<Option<egui::Context>>,
+}
+
+impl Inbox {
+    pub fn push(&self, command: Command) {
+        if let Ok(mut commands) = self.commands.lock() {
+            commands.push(command);
+        }
+        if let Ok(window) = self.window.lock() {
+            if let Some(context) = window.as_ref() {
+                context.request_repaint();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        gtk::glib::MainContext::default().wakeup();
+    }
+
+    fn take(&self) -> Vec<Command> {
+        self.commands
+            .lock()
+            .map(|mut commands| std::mem::take(&mut *commands))
+            .unwrap_or_default()
+    }
+
+    fn set_window(&self, context: Option<egui::Context>) {
+        if let Ok(mut window) = self.window.lock() {
+            *window = context;
+        }
+    }
+}
+
 struct Tray {
     _icon: TrayIcon,
     enabled: MenuItem,
-    configure: MenuItem,
-    quit: MenuItem,
 }
 
 impl Tray {
-    fn new(remapping_enabled: bool) -> Result<Self> {
+    fn new(remapping_enabled: bool, inbox: Arc<Inbox>) -> Result<Self> {
         let menu = Menu::new();
         let enabled = MenuItem::new(enabled_menu_text(remapping_enabled), true, None);
         let configure = MenuItem::new("Configure", true, None);
@@ -83,11 +173,20 @@ impl Tray {
             .build()
             .context("create system tray icon")?;
 
+        let ids = [
+            (enabled.id().clone(), Command::ToggleEnabled),
+            (configure.id().clone(), Command::Configure),
+            (quit.id().clone(), Command::Quit),
+        ];
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if let Some((_, command)) = ids.iter().find(|(id, _)| *id == event.id) {
+                inbox.push(*command);
+            }
+        }));
+
         Ok(Self {
             _icon: tray_icon,
             enabled,
-            configure,
-            quit,
         })
     }
 
@@ -96,25 +195,17 @@ impl Tray {
     }
 }
 
-struct NocapsApp {
+/// Everything that outlives a settings window: the keyboard hook, the configuration,
+/// the tray icon and the last status message.
+struct Core {
     keyboard: Option<Arc<KeyboardManager>>,
     config: Config,
     store: ConfigStore,
-    /// The window starts in the tray unless something needs the user's attention.
-    /// eframe always shows the window after its first frame, so it is hidden again
-    /// from `logic` on that frame.
-    show_on_start: bool,
-    started: bool,
-    quitting: bool,
     tray: Option<Tray>,
-    // Tray menu activations arrive on muda's event handler, which may run on a
-    // native callback rather than the egui frame. The handler parks events here
-    // and wakes the UI; `process_tray_events` drains them on the next frame.
-    tray_events: Arc<Mutex<Vec<MenuEvent>>>,
-    icon: egui::TextureHandle,
+    inbox: Arc<Inbox>,
     runtime_error: Option<String>,
     status: Option<Status>,
-    capturing: Option<Action>,
+    quitting: bool,
 }
 
 struct Status {
@@ -122,30 +213,16 @@ struct Status {
     message: String,
 }
 
-impl NocapsApp {
+impl Core {
     fn new(
         keyboard: Option<Arc<KeyboardManager>>,
         config: Config,
         store: ConfigStore,
         startup_error: Option<String>,
-        context: &egui::Context,
+        inbox: Arc<Inbox>,
     ) -> Self {
-        let tray_events: Arc<Mutex<Vec<MenuEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let (tray, tray_error) = match create_tray(config.enabled) {
-            Ok(tray) => {
-                // Forward tray activations onto our queue and wake the UI thread,
-                // so the egui loop can stay idle (no periodic polling) until the
-                // user actually clicks a menu item.
-                let queue = Arc::clone(&tray_events);
-                let context = context.clone();
-                MenuEvent::set_event_handler(Some(move |event| {
-                    if let Ok(mut queue) = queue.lock() {
-                        queue.push(event);
-                    }
-                    context.request_repaint();
-                }));
-                (Some(tray), None)
-            }
+        let (tray, tray_error) = match create_tray(config.enabled, Arc::clone(&inbox)) {
+            Ok(tray) => (Some(tray), None),
             Err(error) => (None, Some(format!("{error:#}"))),
         };
 
@@ -165,13 +242,65 @@ impl NocapsApp {
             keyboard,
             config,
             store,
-            show_on_start: !errors.is_empty(),
-            started: false,
-            quitting: false,
             tray,
-            tray_events,
+            inbox,
             runtime_error: (!errors.is_empty()).then(|| errors.join("\n")),
             status: None,
+            quitting: false,
+        }
+    }
+
+    fn toggle_enabled(&mut self) {
+        self.config.enabled = !self.config.enabled;
+        self.persist(if self.config.enabled {
+            "Remapping on".to_owned()
+        } else {
+            "Remapping off".to_owned()
+        });
+    }
+
+    fn persist(&mut self, success_message: String) {
+        let keyboard = self.keyboard.as_deref();
+        let result = BINDINGS
+            .apply(&self.config)
+            .and_then(|()| keyboard.map_or(Ok(()), |k| k.set_enabled(self.config.enabled)))
+            .and_then(|()| self.store.save(&self.config));
+        if let Some(tray) = &self.tray {
+            tray.set_enabled(self.config.enabled);
+        }
+        self.status = Some(match result {
+            Ok(()) => Status {
+                is_error: false,
+                message: success_message,
+            },
+            Err(error) => Status {
+                is_error: true,
+                message: format!("{error:#}"),
+            },
+        });
+    }
+}
+
+/// The settings window: a view over [`Core`] that lives only as long as the window.
+struct NocapsApp<'a> {
+    core: &'a mut Core,
+    /// eframe always shows the window after its first frame, so a window meant to
+    /// start in the tray is hidden again from `logic` on that frame.
+    hide_on_start: bool,
+    started: bool,
+    icon: egui::TextureHandle,
+    capturing: Option<Action>,
+}
+
+impl<'a> NocapsApp<'a> {
+    fn new(core: &'a mut Core, visible: bool, context: &egui::Context) -> Self {
+        core.inbox.set_window(Some(context.clone()));
+        // A status from an earlier window session would be stale by now.
+        core.status = None;
+        Self {
+            core,
+            hide_on_start: !visible,
+            started: false,
             capturing: None,
             icon: context.load_texture(
                 "nocaps-icon",
@@ -184,28 +313,15 @@ impl NocapsApp {
         }
     }
 
-    fn process_tray_events(&mut self, context: &egui::Context) {
-        let Some(tray) = self.tray.as_ref() else {
-            return;
-        };
-        let enabled_id = tray.enabled.id().clone();
-        let configure_id = tray.configure.id().clone();
-        let quit_id = tray.quit.id().clone();
-        let events: Vec<MenuEvent> = match self.tray_events.lock() {
-            Ok(mut queue) => queue.drain(..).collect(),
-            Err(_) => return,
-        };
-        for event in events {
-            let toggle_enabled = event.id == enabled_id;
-            let configure = event.id == configure_id;
-            let quit = event.id == quit_id;
-            if toggle_enabled {
-                self.toggle_enabled();
-            } else if configure {
-                context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                context.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if quit {
-                self.quit(context);
+    fn process_commands(&mut self, context: &egui::Context) {
+        for command in self.core.inbox.take() {
+            match command {
+                Command::ToggleEnabled => self.core.toggle_enabled(),
+                Command::Configure => {
+                    context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    context.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                Command::Quit => self.quit(context),
             }
         }
     }
@@ -238,16 +354,16 @@ impl NocapsApp {
         };
         match input_key_from_egui(pressed) {
             Some(key) => {
-                self.config.bind(action, key);
+                self.core.config.bind(action, key);
                 self.capturing = None;
-                self.persist(format!(
+                self.core.persist(format!(
                     "{} is now Caps Lock + {}",
                     action.label(),
                     key.label()
                 ));
             }
             None => {
-                self.status = Some(Status {
+                self.core.status = Some(Status {
                     is_error: true,
                     message: "That key cannot be used as a binding.".to_owned(),
                 });
@@ -255,44 +371,14 @@ impl NocapsApp {
         }
     }
 
-    fn toggle_enabled(&mut self) {
-        self.config.enabled = !self.config.enabled;
-        self.persist(if self.config.enabled {
-            "Remapping on".to_owned()
-        } else {
-            "Remapping off".to_owned()
-        });
-    }
-
     fn quit(&mut self, context: &egui::Context) {
-        self.quitting = true;
+        self.core.quitting = true;
         context.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-
-    fn persist(&mut self, success_message: String) {
-        let keyboard = self.keyboard.as_deref();
-        let result = BINDINGS
-            .apply(&self.config)
-            .and_then(|()| keyboard.map_or(Ok(()), |k| k.set_enabled(self.config.enabled)))
-            .and_then(|()| self.store.save(&self.config));
-        if let Some(tray) = &self.tray {
-            tray.set_enabled(self.config.enabled);
-        }
-        self.status = Some(match result {
-            Ok(()) => Status {
-                is_error: false,
-                message: success_message,
-            },
-            Err(error) => Status {
-                is_error: true,
-                message: format!("{error:#}"),
-            },
-        });
     }
 
     fn action_row(&mut self, ui: &mut egui::Ui, action: Action) {
         let capturing = self.capturing == Some(action);
-        let binding = self.config.key_for(action);
+        let binding = self.core.config.key_for(action);
         ui.horizontal(|ui| {
             ui.set_min_height(21.0);
             let label = ui.label(
@@ -311,9 +397,9 @@ impl NocapsApp {
                         .frame(false),
                 );
                 if clear.on_hover_text("Clear binding").clicked() {
-                    self.config.unbind(action);
+                    self.core.config.unbind(action);
                     self.capturing = None;
-                    self.persist(format!("{} cleared", action.label()));
+                    self.core.persist(format!("{} cleared", action.label()));
                 }
 
                 if keycap(ui, binding, capturing).clicked() {
@@ -321,7 +407,7 @@ impl NocapsApp {
                         self.capturing = None;
                     } else {
                         self.capturing = Some(action);
-                        self.status = None;
+                        self.core.status = None;
                     }
                 }
             });
@@ -394,15 +480,15 @@ impl NocapsApp {
                     .size(11.5)
                     .color(MUTED),
             )
-            .on_hover_text(format!("Config: {}", self.store.path().display()));
+            .on_hover_text(format!("Config: {}", self.core.store.path().display()));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = self.config.enabled;
+                let enabled = self.core.config.enabled;
                 if toggle_switch(ui, enabled)
                     .on_hover_text("Turn Caps Lock remapping on or off")
                     .clicked()
                 {
-                    self.toggle_enabled();
+                    self.core.toggle_enabled();
                 }
                 // Reserve the width of the longer word so the buttons to the left stay
                 // put when the label flips.
@@ -435,11 +521,11 @@ impl NocapsApp {
                     .on_hover_text("Restore the default bindings")
                     .clicked()
                 {
-                    self.config = Config::default();
+                    self.core.config = Config::default();
                     self.capturing = None;
-                    self.persist("Defaults restored".to_owned());
+                    self.core.persist("Defaults restored".to_owned());
                 }
-                if self.tray.is_none() && ui.add(outlined_button("Quit")).clicked() {
+                if self.core.tray.is_none() && ui.add(outlined_button("Quit")).clicked() {
                     self.quit(ui.ctx());
                 }
             });
@@ -456,9 +542,9 @@ impl NocapsApp {
                 MUTED,
                 CORAL,
             )
-        } else if let Some(error) = &self.runtime_error {
+        } else if let Some(error) = &self.core.runtime_error {
             (error.replace('\n', "  "), CORAL, CORAL)
-        } else if let Some(status) = &self.status {
+        } else if let Some(status) = &self.core.status {
             if status.is_error {
                 (status.message.clone(), CORAL, CORAL)
             } else {
@@ -480,31 +566,37 @@ impl NocapsApp {
     }
 }
 
-impl eframe::App for NocapsApp {
+impl Drop for NocapsApp<'_> {
+    fn drop(&mut self) {
+        self.core.inbox.set_window(None);
+    }
+}
+
+impl eframe::App for NocapsApp<'_> {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        if !std::mem::replace(&mut self.started, true) && !self.show_on_start {
+        if !std::mem::replace(&mut self.started, true) && self.hide_on_start {
             context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         pump_native_tray_events();
-        self.process_tray_events(context);
+        self.process_commands(context);
         self.capture_pressed_key(context);
 
-        // Closing the window sends it back to the tray; only Quit exits.
-        if context.input(|input| input.viewport().close_requested())
-            && !self.quitting
-            && self.tray.is_some()
-        {
-            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Closing the window sends it back to the tray; only Quit exits. On Linux the
+        // window really closes, which returns control to the tray loop in `run`.
+        if context.input(|input| input.viewport().close_requested()) {
             self.capturing = None;
+            if cfg!(not(target_os = "linux")) && !self.core.quitting && self.core.tray.is_some() {
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
 
-        // Tray clicks wake the UI via the muda event handler, and egui already
-        // repaints on its own window input, so no periodic repaint is needed to
-        // stay responsive while idle. Linux is the exception: its AppIndicator
-        // menu only emits events while the GTK loop is iterated by
-        // `pump_native_tray_events`, so keep a gentle tick to drive that pump.
+        // Tray clicks wake the UI through the inbox, and egui already repaints on its
+        // own window input, so no periodic repaint is needed to stay responsive while
+        // idle. Linux is the exception: its AppIndicator menu only emits events while
+        // the GTK loop is iterated by `pump_native_tray_events`, so keep a gentle tick
+        // to drive that pump while the window is open.
         #[cfg(target_os = "linux")]
         context.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -796,7 +888,7 @@ fn window_icon() -> egui::IconData {
 }
 
 #[cfg(target_os = "linux")]
-fn create_tray(enabled: bool) -> Result<Tray> {
+fn create_tray(enabled: bool, inbox: Arc<Inbox>) -> Result<Tray> {
     let appindicator_available = ["libayatana-appindicator3.so.1", "libappindicator3.so.1"]
         .iter()
         .any(|name| unsafe { libloading::Library::new(name).is_ok() });
@@ -805,13 +897,59 @@ fn create_tray(enabled: bool) -> Result<Tray> {
             "install the Ayatana AppIndicator 3 runtime library"
         ));
     }
-    std::panic::catch_unwind(|| Tray::new(enabled))
+    std::panic::catch_unwind(|| Tray::new(enabled, inbox))
         .map_err(|_| anyhow::anyhow!("create Linux tray icon"))?
 }
 
 #[cfg(not(target_os = "linux"))]
-fn create_tray(enabled: bool) -> Result<Tray> {
-    Tray::new(enabled)
+fn create_tray(enabled: bool, inbox: Arc<Inbox>) -> Result<Tray> {
+    Tray::new(enabled, inbox)
+}
+
+/// GNOME and other docks pick a window's icon by matching its app id to a desktop
+/// entry; without one, the settings window shows up as a generic cog. The entry also
+/// lists nocaps in the app grid, where launching it again opens the running
+/// instance's window. Rewritten only when its content changes, e.g. after the binary
+/// moves.
+#[cfg(target_os = "linux")]
+fn install_desktop_entry() -> Result<()> {
+    const ICON_PNG: &[u8] = include_bytes!("../assets/nocaps-icon.png");
+
+    let data_dir = directories::BaseDirs::new()
+        .context("find the home directory")?
+        .data_dir()
+        .to_owned();
+    let icon_path = data_dir.join("nocaps").join("nocaps.png");
+    let entry_path = data_dir.join("applications").join("nocaps.desktop");
+    let exe = std::env::current_exe().context("find the nocaps executable")?;
+
+    let entry = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=nocaps\n\
+         Comment=Hold Caps Lock for navigation, editing and media keys\n\
+         Exec=\"{}\"\n\
+         Icon={}\n\
+         Terminal=false\n\
+         Categories=Utility;\n\
+         StartupWMClass=nocaps\n",
+        exe.display(),
+        icon_path.display()
+    );
+
+    write_if_changed(&icon_path, ICON_PNG)?;
+    write_if_changed(&entry_path, entry.as_bytes())
+}
+
+#[cfg(target_os = "linux")]
+fn write_if_changed(path: &std::path::Path, content: &[u8]) -> Result<()> {
+    if std::fs::read(path).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(path, content).with_context(|| format!("write {}", path.display()))
 }
 
 fn enabled_menu_text(enabled: bool) -> &'static str {
