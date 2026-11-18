@@ -46,6 +46,7 @@ const KEYCODE_F18: CGKeyCode = 0x4F;
 const LEFT_SHIFT_FLAGS: u64 = CGEventFlags::CGEventFlagShift.bits() | 0x0000_0002;
 const LEFT_COMMAND_FLAGS: u64 = CGEventFlags::CGEventFlagCommand.bits() | 0x0000_0008;
 const LEFT_OPTION_FLAGS: u64 = CGEventFlags::CGEventFlagAlternate.bits() | 0x0000_0020;
+const LEFT_CONTROL_FLAGS: u64 = CGEventFlags::CGEventFlagControl.bits() | 0x0000_0001;
 const MODIFIER_FLAGS: u64 = CGEventFlags::CGEventFlagShift.bits()
     | CGEventFlags::CGEventFlagControl.bits()
     | CGEventFlags::CGEventFlagAlternate.bits()
@@ -197,6 +198,8 @@ struct TapState {
     layer_held: bool,
     /// Caps Lock + the Control action's key is held: movement and deletion go by words.
     word_held: bool,
+    /// Caps Lock + the Workspace action's key is held: Left/Right switch Space.
+    workspace_held: bool,
     layer_flags: u64,
     held: [Option<Held>; InputKey::COUNT],
     /// Number of `Some` entries in `held`, so the idle fast path needs no scan.
@@ -217,6 +220,7 @@ impl TapState {
             enigo,
             layer_held: false,
             word_held: false,
+            workspace_held: false,
             layer_flags: 0,
             held: [None; InputKey::COUNT],
             held_count: 0,
@@ -307,8 +311,13 @@ impl TapState {
             (None, true) if self.layer_held && !repeat => match BINDINGS.action_for(key) {
                 Some(action) => {
                     self.held_count += 1;
-                    if let MacOutput::Key(code) = mac_output(action) {
-                        let (code, extra) = mac_keystroke(code, self.word_held);
+                    let keystroke = match mac_output(action) {
+                        MacOutput::Key(code) => {
+                            Some(mac_keystroke(code, self.word_held, self.workspace_held))
+                        }
+                        _ => None,
+                    };
+                    if let Some((code, extra)) = keystroke {
                         *slot = Some(Held::Key { code, flags: extra });
                         self.post_layered_key(proxy, code, extra, true, false, flags);
                     } else {
@@ -360,6 +369,11 @@ impl TapState {
         match mac_output(action) {
             MacOutput::Key(code) => {
                 self.post_layered_key(proxy, code, 0, down, repeat, physical_flags);
+            }
+            MacOutput::Workspace => {
+                if !repeat {
+                    self.workspace_held = down;
+                }
             }
             MacOutput::Word => {
                 if !repeat {
@@ -490,6 +504,7 @@ fn modifier_keycode(flags: u64) -> Option<CGKeyCode> {
     match flags {
         LEFT_OPTION_FLAGS => Some(0x3A),
         LEFT_COMMAND_FLAGS => Some(0x37),
+        LEFT_CONTROL_FLAGS => Some(0x3B),
         _ => None,
     }
 }
@@ -641,8 +656,10 @@ const KEY_UP: CGKeyCode = 0x7E;
 
 /// Translates a layered key into the Mac keystroke that does what the same combination
 /// does on Windows, returning the key and the modifiers to add.
-fn mac_keystroke(code: CGKeyCode, word: bool) -> (CGKeyCode, u64) {
+fn mac_keystroke(code: CGKeyCode, word: bool, workspace: bool) -> (CGKeyCode, u64) {
     match (code, word) {
+        // Mission Control's default "Move left/right a space" shortcuts.
+        (KEY_LEFT | KEY_RIGHT, _) if workspace => (code, LEFT_CONTROL_FLAGS),
         // Line start/end, and document start/end with the word modifier.
         (KEY_HOME, false) => (KEY_LEFT, LEFT_COMMAND_FLAGS),
         (KEY_END, false) => (KEY_RIGHT, LEFT_COMMAND_FLAGS),
@@ -660,6 +677,8 @@ enum MacOutput {
     Key(CGKeyCode),
     /// Changes how layered movement keys are translated; sends nothing by itself.
     Word,
+    /// Turns layered Left/Right into Space switching; sends nothing by itself.
+    Workspace,
     Modifier(CGKeyCode, u64),
     Media(EnigoKey),
 }
@@ -691,6 +710,7 @@ fn mac_output(action: Action) -> MacOutput {
         Action::MediaPrevious => Media(EnigoKey::MediaPrevTrack),
         Action::MediaPlayPause => Media(EnigoKey::MediaPlayPause),
         Action::MediaNext => Media(EnigoKey::MediaNextTrack),
+        Action::Workspace => MacOutput::Workspace,
     }
 }
 
@@ -815,24 +835,36 @@ mod tests {
 
     #[test]
     fn layered_keys_translate_to_mac_equivalents() {
-        assert_eq!(mac_keystroke(KEY_LEFT, false), (KEY_LEFT, 0));
-        assert_eq!(mac_keystroke(KEY_LEFT, true), (KEY_LEFT, LEFT_OPTION_FLAGS));
+        assert_eq!(mac_keystroke(KEY_LEFT, false, false), (KEY_LEFT, 0));
         assert_eq!(
-            mac_keystroke(KEY_BACKSPACE, true),
+            mac_keystroke(KEY_LEFT, true, false),
+            (KEY_LEFT, LEFT_OPTION_FLAGS)
+        );
+        assert_eq!(
+            mac_keystroke(KEY_BACKSPACE, true, false),
             (KEY_BACKSPACE, LEFT_OPTION_FLAGS)
         );
         assert_eq!(
-            mac_keystroke(KEY_HOME, false),
+            mac_keystroke(KEY_HOME, false, false),
             (KEY_LEFT, LEFT_COMMAND_FLAGS)
         );
-        assert_eq!(mac_keystroke(KEY_END, true), (KEY_DOWN, LEFT_COMMAND_FLAGS));
-        assert_eq!(mac_keystroke(KEY_RETURN, true), (KEY_RETURN, 0));
+        assert_eq!(
+            mac_keystroke(KEY_END, true, false),
+            (KEY_DOWN, LEFT_COMMAND_FLAGS)
+        );
+        assert_eq!(mac_keystroke(KEY_RETURN, true, false), (KEY_RETURN, 0));
+        assert_eq!(
+            mac_keystroke(KEY_LEFT, true, true),
+            (KEY_LEFT, LEFT_CONTROL_FLAGS)
+        );
+        assert_eq!(mac_keystroke(KEY_UP, false, true), (KEY_UP, 0));
     }
 
     #[test]
     fn translated_modifiers_are_announced_with_their_own_key() {
         assert_eq!(modifier_keycode(LEFT_OPTION_FLAGS), Some(0x3A));
         assert_eq!(modifier_keycode(LEFT_COMMAND_FLAGS), Some(0x37));
+        assert_eq!(modifier_keycode(LEFT_CONTROL_FLAGS), Some(0x3B));
         assert_eq!(modifier_keycode(0), None);
     }
 

@@ -12,6 +12,15 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 static HELD_TARGETS: [AtomicU16; InputKey::COUNT] = [const { AtomicU16::new(0) }; InputKey::COUNT];
 static CAPS_CAPTURED: AtomicBool = AtomicBool::new(false);
 const RELEASE_ALREADY_SENT: u16 = u16::MAX;
+/// Held targets are virtual-key codes (below 0x100); these high bits mark modifiers
+/// pressed around the key for shortcut actions such as switching desktop.
+const WITH_CONTROL: u16 = 0x100;
+const WITH_WIN: u16 = 0x200;
+/// Held target of the Workspace key itself: it sends nothing, but while it is down
+/// layered Left/Right switch virtual desktop (Ctrl+Win+arrow).
+const WORKSPACE_MARK: u16 = 0x400;
+static WORKSPACE_HELD: AtomicBool = AtomicBool::new(false);
+const CHORD_MODIFIERS: [(u16, u16); 2] = [(WITH_CONTROL, VK_LCONTROL.0), (WITH_WIN, VK_LWIN.0)];
 
 pub struct KeyboardManager {
     thread_id: u32,
@@ -113,17 +122,29 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         if target == RELEASE_ALREADY_SENT {
             return LRESULT(1);
         }
+        if is_up && target == WORKSPACE_MARK {
+            WORKSPACE_HELD.store(false, Ordering::Relaxed);
+            return LRESULT(1);
+        }
+        if target == WORKSPACE_MARK {
+            return LRESULT(1);
+        }
         if is_up && target != 0 {
-            send_key(target, false);
+            send_target(target, false);
             return LRESULT(1);
         }
     }
 
     if is_down && CAPS_CAPTURED.load(Ordering::Relaxed) {
         if let Some(source) = source {
-            if let Some(target) = BINDINGS.action_for(source).map(windows_code) {
+            if let Some(action) = BINDINGS.action_for(source) {
+                let target = windows_code(action, WORKSPACE_HELD.load(Ordering::Relaxed));
                 HELD_TARGETS[source.index()].store(target, Ordering::Relaxed);
-                send_key(target, true);
+                if target == WORKSPACE_MARK {
+                    WORKSPACE_HELD.store(true, Ordering::Relaxed);
+                } else {
+                    send_target(target, true);
+                }
                 return LRESULT(1);
             }
         }
@@ -134,6 +155,22 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 
 fn call_next_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Sends a held target, with its chord modifiers pressed first and released last.
+fn send_target(target: u16, down: bool) {
+    let key = target & 0xFF;
+    if !down {
+        send_key(key, false);
+    }
+    for (bit, modifier) in CHORD_MODIFIERS {
+        if target & bit != 0 {
+            send_key(modifier, down);
+        }
+    }
+    if down {
+        send_key(key, true);
+    }
 }
 
 fn send_key(code: u16, down: bool) {
@@ -175,8 +212,11 @@ fn release_held_targets(swallow_physical_release: bool) {
     };
     for target in &HELD_TARGETS {
         let held = target.load(Ordering::Relaxed);
-        if held != 0 && held != RELEASE_ALREADY_SENT {
-            send_key(held, false);
+        if held == WORKSPACE_MARK {
+            WORKSPACE_HELD.store(false, Ordering::Relaxed);
+            target.store(released, Ordering::Relaxed);
+        } else if held != 0 && held != RELEASE_ALREADY_SENT {
+            send_target(held, false);
             target.store(released, Ordering::Relaxed);
         }
     }
@@ -290,8 +330,12 @@ fn key_from_windows_scan(scan: u32, extended: bool) -> Option<InputKey> {
     })
 }
 
-fn windows_code(action: Action) -> u16 {
+fn windows_code(action: Action, workspace: bool) -> u16 {
     match action {
+        Action::Workspace => WORKSPACE_MARK,
+        // Windows' own "switch virtual desktop" shortcut.
+        Action::ArrowLeft if workspace => VK_LEFT.0 | WITH_CONTROL | WITH_WIN,
+        Action::ArrowRight if workspace => VK_RIGHT.0 | WITH_CONTROL | WITH_WIN,
         Action::LeftControl => VK_LCONTROL.0,
         Action::LeftShift => VK_LSHIFT.0,
         Action::LeftAlt => VK_LMENU.0,

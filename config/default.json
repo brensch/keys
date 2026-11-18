@@ -17,6 +17,7 @@
     "volume_mute": "tab",
     "media_previous": "e",
     "media_play_pause": "r",
-    "media_next": "t"
+    "media_next": "t",
+    "workspace": "d"
   }
 }

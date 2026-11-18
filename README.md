@@ -24,11 +24,11 @@ Hold **Caps Lock** and press a bound key. Caps Lock itself never toggles while n
 
 | Hold Caps Lock + | Does | | Hold Caps Lock + | Does |
 | :-: | --- | --- | :-: | --- |
-| <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> | ↑ ← ↓ → | | <kbd>A</kbd> / <kbd>S</kbd> + a movement key | Word jump / Select |
+| <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> | ↑ ← ↓ → | | <kbd>A</kbd> / <kbd>S</kbd> / <kbd>D</kbd> + a movement key | Word jump / Select / Workspace |
 | <kbd>H</kbd> / <kbd>;</kbd> | Home / End | | <kbd>Q</kbd> / <kbd>W</kbd> / <kbd>Tab</kbd> | Volume down / up / mute |
 | <kbd>U</kbd> / <kbd>O</kbd> | Backspace / Delete | | <kbd>E</kbd> / <kbd>R</kbd> / <kbd>T</kbd> | Previous / play-pause / next |
 
-Combine freely: Caps Lock + <kbd>A</kbd> + <kbd>J</kbd> jumps a word left, and adding <kbd>S</kbd> selects it. Combos do the same thing on every OS: on macOS words use Option and Home/End become Cmd+←/→.
+Combine freely: Caps Lock + <kbd>A</kbd> + <kbd>J</kbd> jumps a word left, and adding <kbd>S</kbd> selects it. Combos do the same thing on every OS: on macOS words use Option and Home/End become Cmd+←/→. Caps Lock + <kbd>D</kbd> + <kbd>J</kbd>/<kbd>L</kbd> switches workspace left/right with each OS's own shortcut: Ctrl+Alt+←/→ on Linux, Control+←/→ (Mission Control Spaces) on macOS, Ctrl+Win+←/→ on Windows. On GNOME, adding <kbd>S</kbd> takes the focused window with you.
 
 nocaps runs in the system tray. Choose **Configure** to rebind: click a key, press the new one, and it is applied and saved instantly.
 

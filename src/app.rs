@@ -78,7 +78,7 @@ fn open_window(core: &mut Core, visible: bool) -> Result<()> {
             .with_title("nocaps")
             // Matches nocaps.desktop, so docks and task switchers show the nocaps icon.
             .with_app_id("nocaps")
-            .with_inner_size([560.0, 580.0])
+            .with_inner_size([560.0, 600.0])
             .with_min_inner_size([540.0, 520.0])
             .with_resizable(true)
             .with_visible(visible)

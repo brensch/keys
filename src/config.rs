@@ -232,6 +232,7 @@ pub enum Action {
     MediaPrevious,
     MediaPlayPause,
     MediaNext,
+    Workspace,
 }
 
 impl Action {
@@ -260,6 +261,7 @@ impl Action {
         Self::MediaPrevious,
         Self::MediaPlayPause,
         Self::MediaNext,
+        Self::Workspace,
     ];
 
     pub fn label(self) -> &'static str {
@@ -288,6 +290,7 @@ impl Action {
             Self::MediaPrevious => "Previous track",
             Self::MediaPlayPause => "Play / pause",
             Self::MediaNext => "Next track",
+            Self::Workspace => "Workspace",
         }
     }
 
@@ -310,13 +313,21 @@ impl Action {
             #[cfg(not(target_os = "macos"))]
             Self::LeftControl => Some("Sends Control"),
             Self::LeftShift => Some("Sends Shift"),
+            // Left/Right send the OS's own switch-workspace shortcut, so Select moves
+            // the window too wherever the desktop binds that (GNOME: Shift+Ctrl+Alt+arrow).
+            #[cfg(target_os = "linux")]
+            Self::Workspace => Some("Left/Right switch workspace (Ctrl+Alt+arrow)"),
+            #[cfg(target_os = "macos")]
+            Self::Workspace => Some("Left/Right switch Space (Control+arrow)"),
+            #[cfg(target_os = "windows")]
+            Self::Workspace => Some("Left/Right switch desktop (Ctrl+Win+arrow)"),
             _ => None,
         }
     }
 
     pub fn category(self) -> &'static str {
         match self {
-            Self::LeftControl | Self::LeftShift => "With movement",
+            Self::LeftControl | Self::LeftShift | Self::Workspace => "With movement",
             Self::LeftAlt | Self::LeftMeta => "Modifiers",
             Self::ArrowUp
             | Self::ArrowDown
@@ -551,5 +562,6 @@ mod tests {
         assert_eq!(config.key_for(Action::ArrowDown), Some(InputKey::K));
         assert_eq!(config.key_for(Action::ArrowLeft), Some(InputKey::J));
         assert_eq!(config.key_for(Action::ArrowRight), Some(InputKey::L));
+        assert_eq!(config.key_for(Action::Workspace), Some(InputKey::D));
     }
 }
