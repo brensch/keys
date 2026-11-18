@@ -17,8 +17,11 @@ use std::time::Duration;
 
 /// Caps Lock held on any keyboard activates the layer on every keyboard.
 static LAYER_HOLDERS: AtomicUsize = AtomicUsize::new(0);
-/// Caps Lock + the Workspace action's key held: Left/Right switch workspace instead.
-static WORKSPACE_HOLDERS: AtomicUsize = AtomicUsize::new(0);
+/// How many keyboards hold Caps Lock + a mode key (`MODE_WORKSPACE`, `MODE_FOCUS`),
+/// which turns layered arrows into a desktop shortcut instead.
+static MODE_HOLDERS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+const MODE_WORKSPACE: usize = 0;
+const MODE_FOCUS: usize = 1;
 
 const VIRTUAL_NAME: &str = "nocaps virtual keyboard";
 const INPUT_DIR: &str = "/dev/input";
@@ -86,7 +89,7 @@ impl KeyboardManager {
             supported.insert(KeyCode::new(code));
         }
         for action in Action::ALL {
-            if *action != Action::Workspace {
+            if mode_of(*action).is_none() {
                 supported.insert(linux_action_code(*action));
             }
         }
@@ -380,20 +383,45 @@ impl HeldKeys {
 /// shortcut (Workspace + Left/Right is Ctrl+Alt+arrow).
 #[derive(Clone, Copy)]
 struct Target {
-    /// `KEY_RESERVED` for the Workspace key itself, which only changes Left/Right.
+    /// `KEY_RESERVED` for a mode key itself, which only changes what arrows send.
     key: KeyCode,
+    /// The mode a mode key's press turned on, so its release can turn it off.
+    mode: usize,
     /// Bit `i` set: this press pressed `CHORD_MODIFIERS[i]` and its release must release
     /// it. Modifiers already held (physically or through the layer) are left alone, so
     /// Caps Lock + S + D + J adds Shift and GNOME moves the window to the workspace.
     modifiers: u8,
 }
 
-const CHORD_MODIFIERS: [KeyCode; 2] = [KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTALT];
+const CHORD_MODIFIERS: [KeyCode; 3] = [
+    KeyCode::KEY_LEFTCTRL,
+    KeyCode::KEY_LEFTALT,
+    KeyCode::KEY_LEFTMETA,
+];
+const CTRL: u8 = 1;
+const ALT: u8 = 2;
+const SUPER: u8 = 4;
 
 impl Target {
     const fn plain(key: KeyCode) -> Self {
-        Self { key, modifiers: 0 }
+        Self {
+            key,
+            mode: 0,
+            modifiers: 0,
+        }
     }
+}
+
+const fn mode_of(action: Action) -> Option<usize> {
+    match action {
+        Action::Workspace => Some(MODE_WORKSPACE),
+        Action::Focus => Some(MODE_FOCUS),
+        _ => None,
+    }
+}
+
+fn mode_active(mode: usize) -> bool {
+    MODE_HOLDERS[mode].load(Ordering::Relaxed) > 0
 }
 
 /// One blocking `read` per batch of kernel events and one `write` per batch of output:
@@ -403,7 +431,7 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
     let mut held_targets = [None; InputKey::COUNT];
     let mut held = HeldKeys::new();
     let mut captured_caps = false;
-    let mut workspace_holds = 0;
+    let mut mode_holds = [0usize; 2];
     let mut translated = Vec::with_capacity(64);
 
     loop {
@@ -417,7 +445,7 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
                 } else {
                     error!("stopped reading {name}: {error}");
                 }
-                cleanup_state(captured_caps, workspace_holds, &held, &mut output);
+                cleanup_state(captured_caps, mode_holds, &held, &mut output);
                 return;
             }
         };
@@ -460,10 +488,14 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
                     .unwrap_or(Target::plain(source)),
                 _ if LAYER_HOLDERS.load(Ordering::Relaxed) > 0 => {
                     match input_key.and_then(|key| Some((key, BINDINGS.action_for(key)?))) {
-                        Some((key, Action::Workspace)) => {
-                            workspace_holds += 1;
-                            WORKSPACE_HOLDERS.fetch_add(1, Ordering::Relaxed);
-                            let target = Target::plain(KeyCode::KEY_RESERVED);
+                        Some((key, action)) if mode_of(action).is_some() => {
+                            let mode = mode_of(action).unwrap_or_default();
+                            mode_holds[mode] += 1;
+                            MODE_HOLDERS[mode].fetch_add(1, Ordering::Relaxed);
+                            let target = Target {
+                                mode,
+                                ..Target::plain(KeyCode::KEY_RESERVED)
+                            };
                             held_targets[key.index()] = Some(target);
                             target
                         }
@@ -480,8 +512,8 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
 
             if target.key == KeyCode::KEY_RESERVED {
                 if value == 0 {
-                    workspace_holds -= 1;
-                    WORKSPACE_HOLDERS.fetch_sub(1, Ordering::Relaxed);
+                    mode_holds[target.mode] -= 1;
+                    MODE_HOLDERS[target.mode].fetch_sub(1, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -502,7 +534,7 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
         if has_keys {
             if let Err(error) = output.write_all(as_bytes(&translated)) {
                 error!("stopped writing events for {name}: {error}");
-                cleanup_state(captured_caps, workspace_holds, &held, &mut output);
+                cleanup_state(captured_caps, mode_holds, &held, &mut output);
                 return;
             }
         }
@@ -513,7 +545,7 @@ fn run_device(mut device: RawDevice, mut output: File, name: &str) {
 /// own frame so the compositor sees them before the key, and returns what to send.
 fn press_chord(action: Action, held: &mut HeldKeys, out: &mut Vec<InputEvent>) -> Target {
     let mut target = Target::plain(linux_action_code(action));
-    let wanted = chord_modifiers(action, WORKSPACE_HOLDERS.load(Ordering::Relaxed) > 0);
+    let wanted = chord_modifiers(action, mode_active(MODE_WORKSPACE), mode_active(MODE_FOCUS));
     for (bit, modifier) in CHORD_MODIFIERS.iter().enumerate() {
         if wanted & (1 << bit) != 0 && !held.is_down(*modifier) {
             target.modifiers |= 1 << bit;
@@ -532,19 +564,25 @@ fn press_chord(action: Action, held: &mut HeldKeys, out: &mut Vec<InputEvent>) -
 }
 
 /// Modifiers (as `CHORD_MODIFIERS` bits) an action sends with its key. GNOME, KDE and
-/// most other Linux desktops switch workspace with Ctrl+Alt+Left/Right.
-const fn chord_modifiers(action: Action, workspace: bool) -> u8 {
+/// most other Linux desktops switch workspace with Ctrl+Alt+Left/Right. Focus uses
+/// Super+Ctrl+Alt+arrow, which nothing in GNOME binds, for a tiling extension to take.
+const fn chord_modifiers(action: Action, workspace: bool, focus: bool) -> u8 {
     match action {
-        Action::ArrowLeft | Action::ArrowRight if workspace => 0b11,
+        Action::ArrowLeft | Action::ArrowRight | Action::ArrowUp | Action::ArrowDown if focus => {
+            SUPER | CTRL | ALT
+        }
+        Action::ArrowLeft | Action::ArrowRight if workspace => CTRL | ALT,
         _ => 0,
     }
 }
 
-fn cleanup_state(captured_caps: bool, workspace_holds: usize, held: &HeldKeys, output: &mut File) {
+fn cleanup_state(captured_caps: bool, mode_holds: [usize; 2], held: &HeldKeys, output: &mut File) {
     if captured_caps {
         LAYER_HOLDERS.fetch_sub(1, Ordering::Relaxed);
     }
-    WORKSPACE_HOLDERS.fetch_sub(workspace_holds, Ordering::Relaxed);
+    for (holders, holds) in MODE_HOLDERS.iter().zip(mode_holds) {
+        holders.fetch_sub(holds, Ordering::Relaxed);
+    }
     let mut releases: Vec<InputEvent> = held
         .codes()
         .map(|code| InputEvent::new(EventType::KEY.0, code, 0))
@@ -683,6 +721,6 @@ fn linux_action_code(action: Action) -> KeyCode {
         Action::MediaPrevious => KeyCode::KEY_PREVIOUSSONG,
         Action::MediaPlayPause => KeyCode::KEY_PLAYPAUSE,
         Action::MediaNext => KeyCode::KEY_NEXTSONG,
-        Action::Workspace => KeyCode::KEY_RESERVED,
+        Action::Workspace | Action::Focus => KeyCode::KEY_RESERVED,
     }
 }

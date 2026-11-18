@@ -19,6 +19,8 @@ const WITH_WIN: u16 = 0x200;
 /// Held target of the Workspace key itself: it sends nothing, but while it is down
 /// layered Left/Right switch virtual desktop (Ctrl+Win+arrow).
 const WORKSPACE_MARK: u16 = 0x400;
+/// Held target of a bound key with no Windows behaviour yet (window focus): swallowed.
+const NOTHING_MARK: u16 = 0x800;
 static WORKSPACE_HELD: AtomicBool = AtomicBool::new(false);
 const CHORD_MODIFIERS: [(u16, u16); 2] = [(WITH_CONTROL, VK_LCONTROL.0), (WITH_WIN, VK_LWIN.0)];
 
@@ -126,7 +128,10 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             WORKSPACE_HELD.store(false, Ordering::Relaxed);
             return LRESULT(1);
         }
-        if target == WORKSPACE_MARK {
+        if target == WORKSPACE_MARK || target == NOTHING_MARK {
+            if is_up {
+                held.store(0, Ordering::Relaxed);
+            }
             return LRESULT(1);
         }
         if is_up && target != 0 {
@@ -142,7 +147,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                 HELD_TARGETS[source.index()].store(target, Ordering::Relaxed);
                 if target == WORKSPACE_MARK {
                     WORKSPACE_HELD.store(true, Ordering::Relaxed);
-                } else {
+                } else if target != NOTHING_MARK {
                     send_target(target, true);
                 }
                 return LRESULT(1);
@@ -212,8 +217,10 @@ fn release_held_targets(swallow_physical_release: bool) {
     };
     for target in &HELD_TARGETS {
         let held = target.load(Ordering::Relaxed);
-        if held == WORKSPACE_MARK {
-            WORKSPACE_HELD.store(false, Ordering::Relaxed);
+        if held == WORKSPACE_MARK || held == NOTHING_MARK {
+            if held == WORKSPACE_MARK {
+                WORKSPACE_HELD.store(false, Ordering::Relaxed);
+            }
             target.store(released, Ordering::Relaxed);
         } else if held != 0 && held != RELEASE_ALREADY_SENT {
             send_target(held, false);
@@ -333,6 +340,7 @@ fn key_from_windows_scan(scan: u32, extended: bool) -> Option<InputKey> {
 fn windows_code(action: Action, workspace: bool) -> u16 {
     match action {
         Action::Workspace => WORKSPACE_MARK,
+        Action::Focus => NOTHING_MARK,
         // Windows' own "switch virtual desktop" shortcut.
         Action::ArrowLeft if workspace => VK_LEFT.0 | WITH_CONTROL | WITH_WIN,
         Action::ArrowRight if workspace => VK_RIGHT.0 | WITH_CONTROL | WITH_WIN,

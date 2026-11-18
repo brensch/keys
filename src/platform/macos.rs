@@ -375,6 +375,7 @@ impl TapState {
                     self.workspace_held = down;
                 }
             }
+            MacOutput::Nothing => {}
             MacOutput::Word => {
                 if !repeat {
                     self.word_held = down;
@@ -679,6 +680,8 @@ enum MacOutput {
     Word,
     /// Turns layered Left/Right into Space switching; sends nothing by itself.
     Workspace,
+    /// Swallowed: the key is bound but has no macOS behaviour yet.
+    Nothing,
     Modifier(CGKeyCode, u64),
     Media(EnigoKey),
 }
@@ -711,6 +714,8 @@ fn mac_output(action: Action) -> MacOutput {
         Action::MediaPlayPause => Media(EnigoKey::MediaPlayPause),
         Action::MediaNext => Media(EnigoKey::MediaNextTrack),
         Action::Workspace => MacOutput::Workspace,
+        // Window focus needs nocaps to move focus itself on macOS; not built yet.
+        Action::Focus => MacOutput::Nothing,
     }
 }
 

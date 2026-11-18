@@ -233,6 +233,7 @@ pub enum Action {
     MediaPlayPause,
     MediaNext,
     Workspace,
+    Focus,
 }
 
 impl Action {
@@ -262,6 +263,7 @@ impl Action {
         Self::MediaPlayPause,
         Self::MediaNext,
         Self::Workspace,
+        Self::Focus,
     ];
 
     pub fn label(self) -> &'static str {
@@ -291,6 +293,7 @@ impl Action {
             Self::MediaPlayPause => "Play / pause",
             Self::MediaNext => "Next track",
             Self::Workspace => "Workspace",
+            Self::Focus => "Window focus",
         }
     }
 
@@ -321,13 +324,19 @@ impl Action {
             Self::Workspace => Some("Left/Right switch Space (Control+arrow)"),
             #[cfg(target_os = "windows")]
             Self::Workspace => Some("Left/Right switch desktop (Ctrl+Win+arrow)"),
+            // Super+Ctrl+Alt+arrow is free in GNOME; a tiling extension's directional
+            // focus is bound to it (Tiling Shell: focus-window-left/right/up/down).
+            #[cfg(target_os = "linux")]
+            Self::Focus => Some("Arrows focus the next window (Super+Ctrl+Alt+arrow)"),
+            #[cfg(not(target_os = "linux"))]
+            Self::Focus => Some("Not available on this OS yet"),
             _ => None,
         }
     }
 
     pub fn category(self) -> &'static str {
         match self {
-            Self::LeftControl | Self::LeftShift | Self::Workspace => "With movement",
+            Self::LeftControl | Self::LeftShift | Self::Workspace | Self::Focus => "With movement",
             Self::LeftAlt | Self::LeftMeta => "Modifiers",
             Self::ArrowUp
             | Self::ArrowDown
@@ -563,5 +572,6 @@ mod tests {
         assert_eq!(config.key_for(Action::ArrowLeft), Some(InputKey::J));
         assert_eq!(config.key_for(Action::ArrowRight), Some(InputKey::L));
         assert_eq!(config.key_for(Action::Workspace), Some(InputKey::D));
+        assert_eq!(config.key_for(Action::Focus), Some(InputKey::F));
     }
 }

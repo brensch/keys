@@ -18,6 +18,7 @@
     "media_previous": "e",
     "media_play_pause": "r",
     "media_next": "t",
-    "workspace": "d"
+    "workspace": "d",
+    "focus": "f"
   }
 }
